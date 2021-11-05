@@ -2767,7 +2767,7 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
  //if((!Ply)&&(!(Gm->Threadn))) while(Gm->Rootmvs[n]) Gm->Rootmvs[n++]&=0xFFBF;	// clear rootmove processed flags if no helper
  if(!Ply) while(Gm->Rootmvs[n]) Gm->Rootmvs[n++]&=0xFFBF;				// clear rootmove processed flags if no helper
 
- if((!Ply)&&(Gm->Threadn)&1) Mv.s=1;									// skip hashmove for every second thread
+ if((!Ply)&&(Gm->Threadn)==1) Mv.s=1;									// skip hashmove for every second thread
 
  while(Mov=PickMove(Gm,&Mv))											// loop through moves
  {
