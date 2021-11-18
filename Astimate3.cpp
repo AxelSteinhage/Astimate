@@ -83,9 +83,6 @@ typedef struct															// game structure
 	Dbyte									Move_m;						// moves made in initial position
 	Dbyte									Move_r;						// move number at root
 	Dbyte									Matsig;						// material signature
-	short									Val;						// value of root position
-	short									Alpha;						// lower bound at root
-	short									Beta;						// upper bound at root
 	short									Lastval;					// last best value
 	Byte									idepth;						// depth of iteration
 	Byte									phase;						// game phase
@@ -240,18 +237,20 @@ Paras[96]	= {
 	{"SuddenDeathMoves",		 30,	1,	 200,  1},					// estimated number of moves to go
 	{"SuddenDeathWInc",			  7,	1,	 200,  1},					// sudden death moves to go with increment
 	{"HardBreakTimeFactor",		  5,	1,	  20,  1},					// stop calculation after x times planned time
-	{"HelperThreads",			  4, 	0,	  50,  0},					// number of helper threads
+	{"HelperThreads",			  3, 	0,	  50,  0},					// number of helper threads
 	{"LMRBadMoveReduction",		  2,    0,     3,  0},					// reduction for bad moves
 	{"PromotionPruning",		800,  500,	1500,  0}					// promotion pruning value in Qsearch
 };
 
-short 	Maxply,(*recog[1024])(Game*,Byte*),Malpha,Mbeta,Mval;			// recognition function pointers
-Byte 	*hash_t,*phash_t,*mhash_t,*ehash_t,level,maxdepth,nmate,idepth;	// transposition-,pawn-,material and evaluation hash table
+short 	Maxply,(*recog[1024])(Game*,Byte*);								// recognition function pointers
+Byte 	*hash_t,*phash_t,*mhash_t,*ehash_t,level,maxdepth,nmate;		// transposition-,pawn-,material and evaluation hash table
 BitMap	HEN,PEN,MEN,EEN,DEN,HASHFILL,ALLNODES,MAXNODES;             	// number of transposition table entries
 Dbyte	Pv[PVN],Movestogo;									            // maximal ply, pv table	
 clock_t StartTime;														// start time of calculation
 Fbyte	Tmax,Wtime,Btime,Winc,Binc,Movetime;							// time variables										
 volatile bool Stop,Ponder;												// stop calculation, ponder mode
+volatile short Malpha,Mbeta;
+volatile Byte midepth;
 
 Dbyte	Line[]={0x0900,0x363F,0x1109,0x2E36,0x1A11,0x2D2E,0x221A,0x252D,0x2B22,0x2D25,0x8088,0x352D,0x3600,0x3635};
 
@@ -290,6 +289,7 @@ short 	MatEval(Game*);													// material evaluation
 short 	Evaluation(Game*,Mvs*,short,short);								// evaluation
 short	Qsearch(Game*,short,short,Byte);								// quiescence search
 short	Search(Game*,short,short,Byte,Dbyte*);							// recursive negamax search
+void	*SmpSearchHelper(void*);										// smp search helper thread
 void	*SmpSearch(void*);												// smp main seach thread
 void	IterateSearch(Game*);											// find a best move
 void 	GetPV(Game*);													// retrieve principal variation
@@ -1046,8 +1046,7 @@ Dbyte 	PickMove(Game *Gm, Mvs *Mv)										// picks next move from movelist
   case 0:   (Mv->s)++; if(Hm=Mv->Bestmove)					goto SMove;	// hash move
   case 1:   (Mv->s)++;
   			if((Gm->Move_n==Gm->Move_r)&&(Hm=Gm->Lastbest)) goto SMove;	// best move of previous iteration, not at ply >0		   
-  case 2:   if((Gm->Move_n>Gm->Move_r)||(Gm->Threadn)) break; 			// deliver root moves, not for helpers or at ply >0
-  			//if(Gm->Move_n>Gm->Move_r) break;
+  case 2:   if((Gm->Move_n>Gm->Move_r)) break;							// deliver root moves, not at ply >0
    			i=0; BM=0; while(Gm->Rootmvs[i])							// parse root moves	 
 			{
   		     if((!(Gm->Rootmvs[i]&64))&&(Gm->TREESIZE[i]>BM))		    // find new move with largest tree 
@@ -1798,6 +1797,7 @@ BitMap 	GetHash(Game* Gm)												// get hash entry
  return 0;																// no fit
 }
 
+
 void	StoreHash(Game* Gm,short Val,Dbyte Move,Byte depth,Byte flags)	// store information in transposition table
 {
  BitMap	LOCK=(Gm->Moves[Gm->Move_n]).HASH;								// lock 
@@ -1821,7 +1821,34 @@ void	StoreHash(Game* Gm,short Val,Dbyte Move,Byte depth,Byte flags)	// store inf
  *(BitMap*)(key)=DATA11; *(BitMap*)(key+8)=(DATA11&NCRC)^LOCK;			// save transposition info with crc
 
 }
+/*
 
+void	StoreHash(Game* Gm,short Val,Dbyte Move,Byte depth,Byte flags)	// store information in transposition table
+{
+ BitMap	LOCK=(Gm->Moves[Gm->Move_n]).HASH;								// lock 
+ Byte* 	key=hash_t+(LOCK%HEN)*32;										// key
+ BitMap DATA11=*(BitMap*)(key);											// contents slot 1
+ BitMap DATA12=*(BitMap*)(key+8);
+ BitMap DATA21=*(BitMap*)(key+16);										// contents slot 2
+ BitMap DATA22=*(BitMap*)(key+24);
+    
+ if(DATA11&0x0400) HASHFILL++;											// first entry
+ else if(!(DATA12^(DATA11&NCRC)^LOCK)) 									// same entry in slot 1
+  {if((Byte)(DATA11&0xFF)>depth) return;} 								// higher depth? -> go back
+ else if(!(DATA22^(DATA21&NCRC)^LOCK)) 									// same entry in slot 2
+   {if((Byte)(DATA21&0xFF)>depth) return; else key+=16;} 				// higher depth? -> go back
+ else if((DATA21&0x0800)||((Byte)(DATA21&0xFF)<(Byte)(DATA11&0xFF)))	// second entry is old or has lower depth
+ 	key+=16;					 
+ 
+ if(Val<(short)(255-MaxScore)) 		Val-=(short)(Gm->Move_n-Gm->Move_r);// adjust negative mate score
+ else if(Val>(short)(MaxScore-255)) Val+=(short)(Gm->Move_n-Gm->Move_r);// adjust positive mate score
+
+ DATA11=((BitMap)(Move)<<32)+(((BitMap)(Val)&0xFFFF)<<16)+				// construct entry
+ 								((BitMap)(flags)<<8)+(BitMap)(depth);	
+ 
+ *(BitMap*)(key)=DATA11; *(BitMap*)(key+8)=(DATA11&NCRC)^LOCK;			// save transposition info with crc
+}
+*/
 bool 	DrawTest(Game* Gm)												// position is a draw?
 {
  Dbyte	Mm,Mn=Gm->Move_n;												// move number
@@ -2726,8 +2753,8 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
  NM&=NM-1; if(!NM) flg|=32; NM&=NM-1;									// at least three legal moves
 
  if(Paras[82].Val&&Ply&&(Gm->Move_n>2)&&(!(flg&72))&&NM&&((Mv.cp&15)>1)	// nullmove pruning allowed, not at ply0, at least 3 moves...
-    &&((Gm->Moves[Gm->Move_n-1]).Mov||(Gm->Moves[Gm->Move_n-2]).Mov))	// ... and 2 pieces, no check, allow silent moves after check																	// double null allowed but not 3 in a row
- {
+    &&((Gm->Moves[Gm->Move_n-1]).Mov||(Gm->Moves[Gm->Move_n-2]).Mov))	// ... and 2 pieces, no check, allow silent moves after check	
+ {																		// double null allowed but not 3 in a row
   Move(Gm,0);															// make nullmove
   if(depth<r+2) 	 Val=-Qsearch(Gm,-Beta,1-Beta,0);					// quiescence search at depth<r+2
   else				 Val=- Search(Gm,-Beta,1-Beta,depth-r-1,&Bm);		// nullsearch with reduction r
@@ -2764,15 +2791,11 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
  if(!(flg&128)) 			Hval=Evaluation(Gm,&Mv,Alpha,Beta);			// get evaluation if not already done
  Mv.o=Mv.s=n=cm=0; if(depth>4) Mv.flg=0xF0; else Mv.flg=0x70;			// counter moves only for d>4
  
- //if((!Ply)&&(!(Gm->Threadn))) while(Gm->Rootmvs[n]) Gm->Rootmvs[n++]&=0xFFBF;	// clear rootmove processed flags if no helper
  if(!Ply) while(Gm->Rootmvs[n]) Gm->Rootmvs[n++]&=0xFFBF;				// clear rootmove processed flags if no helper
-
- if((!Ply)&&(Gm->Threadn)==1) Mv.s=1;									// skip hashmove for every second thread
 
  while(Mov=PickMove(Gm,&Mv))											// loop through moves
  {
-  if(!Ply)//&&(!(Gm->Threadn)))
-   {rm=0; while(Mov!=Gm->Rootmvs[rm]) rm++; Gm->Rootmvs[rm]|=64;}		// flag root move processed
+  if(!Ply) {rm=0; while(Mov!=Gm->Rootmvs[rm]) rm++; Gm->Rootmvs[rm]|=64;}// flag root move processed
   if(Stop) 											return Bestval;		// stop detected
   
   to  =(Byte)((Mov>>8)&63); from=(Byte)(Mov&63); 						// origin and destination of move
@@ -2831,17 +2854,14 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
   UnMove(Gm);															// take back move
  
 AEL:																	// jump here for AEL pruning
-  if(!Ply) //&&(!(Gm->Threadn)))											// root but no IID 
-  {
-   Gm->TREESIZE[rm]=Gm->NODES-NC; // save treesize of root move and count nonloosing moves
-   if(Val>50-MaxScore) (Gm->noloose)++;
-  }
+  if(!Ply)																// root but no IID 
+   {Gm->TREESIZE[rm]=Gm->NODES-NC; if(Val>50-MaxScore) (Gm->noloose)++;}// save treesize of root move and count nonloosing moves
   cm++;
   if(Stop)											return Bestval;		// stop command recognized
   if(Val>Bestval)														// new best value found
   {
    Bestval=Val; *Bestm=Mov&0xFFBF;										// new best value and best move
-   if((!Ply)&&(!(Gm->Threadn)))											// root but no helper
+   if(!Ply)																// root but no helper
    {
    	Gm->Move2Make=Mov; Pv[(Dbyte)(PM)]=*Bestm; Gm->Lastval=Val;			// backup bestmove so far
    	if(Val>Oalpha) PrintPV(Gm,Bestval,Alpha-1,Beta);					// print new PV
@@ -2873,8 +2893,7 @@ AEL:																	// jump here for AEL pruning
 
 Hash:
  
- if((*Bestm)&&(Bestval>Oalpha)&&(Bestval<Beta)&&(!(Gm->Threadn)))		// bestmove exists and pv node, store in pv table	
-  Pv[(Dbyte)(PM)]=*Bestm;  												
+ if((*Bestm)&&(Bestval>Oalpha)&&(Bestval<Beta))	Pv[(Dbyte)(PM)]=*Bestm;	// bestmove exists and pv node, store in pv table	  												
  Mov=*Bestm; f=0;														// initialize hash move and flags
  if(Bestval<=Oalpha) {f|=1; Mov=0;} else if(Bestval>=Beta) f|=2;		// upper or lower bound
  StoreHash(Gm,Bestval,Mov,hdepth,f);									// store search results in hash table
@@ -2897,45 +2916,33 @@ Hash:
  return Bestval;
 }
 
-void	*SmpSearch(void* Ms)
+void	*SmpSearchHelper(void* Ms)
 {
- Game*	Gm;
+ Game*	Gm=(Game*)(Ms);
  
- Gm=(Game*)(Ms); Gm->noloose=0;	Gm->NODES=0;							// set thread parameters
- 																		// reset nonloosing move counter
- if(!Stop) 
-  Gm->Val=Search(Gm,Gm->Alpha,Gm->Beta,Gm->idepth,&(Gm->Bestmove));		// search with open window
- if(!Stop) 
+ Gm->Finished=false;
+ while(!Stop)
  {
-  PrintPV(Gm,Gm->Val,Gm->Alpha,Gm->Beta); Gm->Lastval=Gm->Val;			// print pv
-  	
-  if(Gm->Val<=Gm->Alpha)												// fail low
-  {
-   Gm->noloose=0; 
-   Gm->Val=Search(Gm,-MaxScore,Gm->Val+1,Gm->idepth,&(Gm->Bestmove));	// research with half-open lower window
-   if(!Stop) PrintPV(Gm,Gm->Val,-MaxScore,MaxScore);					// print search result
-  }
-  else if(Gm->Val>=Gm->Beta)											// fail high
-  {
-   Gm->noloose=0; 
-   Gm->Val=Search(Gm,Gm->Val-1,MaxScore,Gm->idepth,&(Gm->Bestmove));	// research with half-open upper window
-  }
+  Gm->noloose=0; Gm->NODES=0; 
+  Gm->idepth=midepth+1+Gm->Threadn/2;									// set thread parameters
+  Search(Gm,Malpha,Mbeta,Gm->idepth,&(Gm->Bestmove));					// search with open window
  }
- Gm->Finished=true;														// thread is finished
-} 
+ Gm->Finished=true;
+}
 
 void	IterateSearch(Game* Gm)											// search for best move
 {
- Mvs		Mv;
- BitMap		BM;
- int		i,j,Nm;
- Byte		md;
- Fbyte		Tplan;
- Dbyte		Prevmove,Bm,Bm1;
- Game		Gp[Paras[93].Val];
+ Mvs			Mv;
+ BitMap			BM;
+ int			i,j,Nm;
+ Byte			md;
+ Fbyte			Tplan;
+ Dbyte			Prevmove,Bm,Bm1;
+ Game			Gp[Paras[93].Val];
+ short			Val;
  
- Gm->Alpha=-MaxScore; Gm->Beta=MaxScore; Gm->Finished=false;            // initialize local values
- md=255; Prevmove=0; Gm->Threadn=0;			
+ Malpha=-MaxScore; Mbeta=MaxScore; md=255; Prevmove=0; Gm->Threadn=0;   // initialize local values
+ 			
  if((Gm->color&&Binc)||((1-Gm->color)&&Winc)) 							// time increment for every move?
   						Nm=Paras[91].Val; else Nm=Paras[90].Val;		// set number of moves for sudden death
  BM=(Gm->Moves[Gm->Move_n]).HASH; BM^=(BM>>32); BM^=(BM>>16); 			// compress hash signature
@@ -2951,7 +2958,7 @@ void	IterateSearch(Game* Gm)											// search for best move
  Mv.s=200; Mv.o=Mv.flg=i=0;												// prepare move picker
  
  while(Gm->Rootmvs[i]=PickMove(Gm,&Mv)) Gm->TREESIZE[i++]=1;            // init treesizes
- if((i<2)&&(level!=1)&&(!Ponder)) {Gm->Move2Make=Gm->Rootmvs[0]; return;}   // one legal move only
+ if((i<2)&&(level!=1)&&(!Ponder)) {Gm->Move2Make=Gm->Rootmvs[0]; return;} // one legal move only
  for(BM=0;BM<2*HEN;BM++) hash_t[16*BM+1]|=0x08;							// set age-flag
  for(i=0;i<256;i++) 
   Gm->Killer[i][0][0]=Gm->Killer[i][1][0]=Gm->Killer[i][2][0]=0;		// clear killer list
@@ -2968,32 +2975,46 @@ void	IterateSearch(Game* Gm)											// search for best move
   default:				Tmax=0;									break;	// infinite: no hard break
  }
  Tmax*=CLOCKS_PER_SEC/1000;												// transform to clock cycles 
-
+ 
+ midepth=3; 
  for(i=0;i<Paras[93].Val;i++) 											// initialize threads
  {
-  Gp[i]=*Gm;
-  Gp[i].Finished=true; Gp[i].idepth=0; Gp[i].Threadn=i+1;
+  Gp[i]=*Gm; Gp[i].Threadn=i+1; 
+  pthread_create(&(Gp[i].Tid), NULL, SmpSearchHelper, (void*)(Gp+i));	// create new helper thread
  }
- 
- for(Gm->idepth=1;Gm->idepth<=md;(Gm->idepth)++)						// iteration
- {   	
-   for(i=0;i<Paras[93].Val;i++) if(Gp[i].Finished)						// parse helper threads
-   {
-  	if(Gp[i].idepth) pthread_join(Gp[i].Tid,NULL); 						// wait until thread has terminated
-	Gp[i].Finished=false;  Gp[i].Alpha=Gm->Alpha; Gp[i].Beta=Gm->Beta;	// initialize new thread
-	Gp[i].idepth=Gm->idepth+i/2+1;										// give helper higher depth
-	pthread_create(&(Gp[i].Tid), NULL, SmpSearch, (void*)(Gp+i));		// create new helper thread
-   } 
- 
-  SmpSearch((void*)(Gm));												// start main search
 
-  if(Stop) Gm->Val=Gm->Lastval; else Gm->Lastval=Gm->Val;				// backup last value
-  if(Gm->idepth>2) 
-   {Gm->Alpha=Gm->Val-Paras[89].Val; Gm->Beta=Gm->Val+Paras[89].Val;}	// set aspiration window
-  else			   {Gm->Alpha=-MaxScore; Gm->Beta=MaxScore;}			// maximal window
-  if(Gm->Val<255-MaxScore) Gm->Alpha=-MaxScore; 						// at most some mate against stm
-  if(Gm->Val>MaxScore-255) Gm->Beta=MaxScore;							// at least some mate for stm	
-  if(((Gm->idepth>=MaxScore-Gm->Val-1)||(Gm->idepth>=MaxScore+Gm->Val))	// shortest mate found
+ for(Gm->idepth=1;Gm->idepth<=md;Gm->idepth++)							// iteration
+ { 
+  Gm->noloose=0; Gm->NODES=0; midepth=Gm->idepth;						// set parameters
+ 
+  //for(i=0;i<250;i++) for(j=0;j<Paras[93].Val;j++) 
+  // Gm->TREESIZE[i]+=Gp[j].TREESIZE[i];								// add complexity of move from all helpers
+   
+  if(!Stop) 
+   Val=Search(Gm,Malpha,Mbeta,midepth,&(Gm->Bestmove));					// search with open window
+  if(!Stop) 
+  {
+   PrintPV(Gm,Val,Malpha,Mbeta); Gm->Lastval=Val;						// print pv
+  	
+   if(Val<=Malpha)														// fail low
+   {
+    Gm->noloose=0; Malpha=-MaxScore; Mbeta=Val+1;
+    Val=Search(Gm,Malpha,Mbeta,midepth,&(Gm->Bestmove));				// research with half-open lower window
+    if(!Stop) PrintPV(Gm,Val,-MaxScore,MaxScore);						// print search result
+   }
+   else if(Val>=Mbeta)													// fail high
+   {
+    Gm->noloose=0; Malpha=Val-1; Mbeta=MaxScore;
+    Val=Search(Gm,Malpha,Mbeta,midepth,&(Gm->Bestmove));				// research with half-open upper window
+   }
+  }
+ 
+  if(Stop) Val=Gm->Lastval; else Gm->Lastval=Val;						// backup last value
+  if(midepth>2) {Malpha=Val-Paras[89].Val; Mbeta=Val+Paras[89].Val;}	// set aspiration window
+  else			{Malpha=-MaxScore; Mbeta=MaxScore;}						// maximal window
+  if(Val<255-MaxScore) Malpha=-MaxScore; 								// at most some mate against stm
+  if(Val>MaxScore-255) Mbeta=MaxScore;									// at least some mate for stm	
+  if(((midepth>=MaxScore-Val-1)||(midepth>=MaxScore+Val))				// shortest mate found
   	 &&(level!=1)) 								Stop=true;
   if(Gm->color) Tplan=Btime+Binc; else Tplan=Wtime+Winc;				// time left
   Tplan*=CLOCKS_PER_SEC/2000;											// transform to clock cycles
@@ -3005,10 +3026,11 @@ void	IterateSearch(Game* Gm)											// search for best move
    											Stop=true; 		break;
    case 3: if(Gm->idepth>=maxdepth)			Stop=true; 		break;		// maximum depth reached
   }
-  if(Stop)	{PrintPV(Gm,Gm->Val,-MaxScore,MaxScore); 		return;}	// print pv and return
+  //if(Stop)	{PrintPV(Gm,Val,-MaxScore,MaxScore); 		return;}		// print pv and return
   if(Gm->Move2Make!=Prevmove) Gm->Lastbest=Prevmove;					// best move has changed
   Prevmove=Gm->Move2Make;												// backup last best move
-  if(Stop)													return;		// stop recognized
+  if(Stop) 																// stop recognized
+   {for(i=0;i<Paras[93].Val;i++) pthread_join(Gp[i].Tid,NULL); return;}	// stop helpers 															
  } 
 }
 
