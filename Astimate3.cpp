@@ -18,7 +18,7 @@
 //
 // Transposition table: 16 bytes per entry, 2 entries per slot
 // 0: depth, 1: flags, 2-3:value, 4-5:move, 6-7: nn,  8-15: lock, 
-// 				flags: (0: upper, 1: lower, 2: first entry, 3: from previous game, ...)
+// 				flags: (0: upper, 1: lower, 2: first entry, 3: from previous game, 4: from Helper,...)
 //
 // Pawn hash table: 40 bytes per entry
 // Byte 0-7:lock, 8-13: white pawn attacks, 14-15: opening value,
@@ -32,8 +32,9 @@
 // Evaluation hash table: 8 Bytes per entry
 // Byte 0-1:evaluation, 2-7:lock 
 //
- 
+
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,19 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <math.h>
+
+#define USE_AVX2   1
+//#define USE_NEON   1
+//#define USE_SSE2   0
+
+#if 		defined(USE_AVX2)
+#include 	<immintrin.h>
+#elif 		defined(USE_NEON)
+#include 	<arm_neon.h>
+#elif 		defined(USE_SSE2)
+#include 	<emmintrin.h>
+#endif
 
 #define max(x, y) (((x) > (y)) ? (x) : (y))
 #define min(x, y) (((x) < (y)) ? (x) : (y))
@@ -61,19 +75,18 @@ typedef struct															// game structure
 	struct	{Byte type,square;} 			Officer[2][16];				// [color][index]
 	struct	{Byte officers,pawns;} 			Count[2];					// piece count
 	struct  {short Open,End;} 				Psv[2];						// piece square values
-	struct	{Byte from,to,cap,castles,ep,fifty,prom; Dbyte Mov;			// origin, destination, captured piece,castles, ep square, fifty move counter ...
-			 bool check; BitMap	HASH;} 		Moves[1000];				// ... promoted piece, compressed move, check, HASH value, move list		  									
+	struct	{Byte 	from,to,type,cap,castles,ep,fifty,prom; Dbyte Mov;	// origin, destination, captured piece,castles, ep square, fifty move counter ...
+			 short 	Val;												// value of current poition
+			 bool 	check; BitMap	HASH;} 	Moves[500];					// ... promoted piece, compressed move, check, HASH value, move list		  									
+	struct  {Dbyte Mov; BitMap Order; Byte flags;}						// root moves flags: 0:move processed, 1:previous multiPV move, 2: exclude move, 3:
+											Root[250];
 	Dbyte									Killer[256][3][2];			// killer moves
 	Dbyte									Counter[2][17][64];			// counter move table
 	BitMap 									POSITION[2][7];				// positions of pieces [color][all, king, ..., pawns]
 	BitMap 									ROTATED[4];					// bitmaps of pieces [all, ]
 	BitMap  								PHASH;						// pawn hash
 	BitMap									MHASH;						// material hash
-	BitMap									NODES;						// node counter	
-	
-	BitMap									TREESIZE[250];
-	Dbyte									Rootmvs[250];
-	
+	BitMap									NODES;						// node counter		
 	Dbyte									Currm;						// move currently calculated
 	Dbyte									Bestmove;					// Bestmove at root position
 	Dbyte									Lastbest;					// best move of previous iterartion
@@ -83,7 +96,10 @@ typedef struct															// game structure
 	Dbyte									Move_m;						// moves made in initial position
 	Dbyte									Move_r;						// move number at root
 	Dbyte									Matsig;						// material signature
+	Dbyte 									Pv[PVN];					// principal variation
 	short									Lastval;					// last best value
+	short									Maxply;						// maximum ply
+	Byte									mpv;						// current Multi PV
 	Byte									idepth;						// depth of iteration
 	Byte									phase;						// game phase
 	Byte									ngen;						// number of generated moves
@@ -92,13 +108,13 @@ typedef struct															// game structure
 	Byte									color;						// color to move
 	Byte									Threadn;					// number of thread
 	pthread_t								Tid;						// thread ID
-	bool volatile							Finished;					// calculation is finished
+	bool volatile							Finished;					// calculation is finished	
 } Game;
 
 typedef struct
 {
 	BitMap									AMVS;						// all moves (for single move detection)
-	BitMap									ADES;						// all destinations stm officers
+	BitMap									ADES;						// all atacks of stm pieces (including pawns)
 	BitMap									OFFM[16];					// stm officers' moves
 	BitMap									PAWM[4];					// stm pawns' moves (capleft,single,capright,double)
 	Dbyte									Prop[8];					// stm promotion piece information
@@ -111,44 +127,65 @@ typedef struct
 	Byte									s;							// current pickmove stage
 	Byte									o;							// current pickmove officer
 	Byte									flg;						// pickmove flags (0: positive SEE, 2: save square, 7: counter moves)
+	Byte									hist;						// number of history moves
 	Byte									cp;							// count pieces that can move
-	Dbyte									Bestmove;					// current Bestmove						
+	Dbyte									Bestmove;					// current Bestmove							
 } Mvs;
 
+typedef struct
+{
+	Fbyte				F_ind[2][64] 	__attribute__((aligned(64)));	// NNUE feature indices white and black
+	int16_t				F_vec[2][512]	__attribute__((aligned(64)));	// NNUE feature vectors white and black
+	int32_t				F_psq[2][8]		__attribute__((aligned(64)));	// NNUE piece square features white and black;
+} NNUE;
+
+struct Statistics {														// Statistics information
+	char	Name[20],Unit[5];											// name and unit of value
+	double 	Val;}														// value
+	
+Stat[4] = {
+	{"tthits",					"%", 0},								// transposition table hits
+	{"tthits2",					"%", 0},								// transposition table hits second slot
+	{"ttcut",					"%", 0},								// tt entry successfully used
+	{"tthelper",				"%", 0}									// entry stems from helper
+};
+	
 struct Opt {															// Astimate's options
 	char	Name[20];													// name of option
 	bool 	Val,Change;}												// default value and change
 	
-Options[8] = {
+Options[10] = {
  	{"UCI",						true,	false},							// uci or terminal mode 	
 	{"UseOpeningTree", 			true,	false},							// use opening book tree
  	{"UseOpeningPoslib",		false,	false},							// use opening book positions
- 	{"DebugMode",				true,	false},							// debug mode
+ 	{"DebugMode",				false,	false},							// debug mode
  	{"InteriorNodeRecog",		true,  	false},							// interior node recognition
  	{"PrePromExtension",		true,	false},							// extend pre promotion moves
  	{"RecaptureExtension",		true,	false},							// extend recaptures
- 	{"AdaptNull",				false,  false}							// decrement null reduction when king is in danger
+ 	{"AdaptNull",				true, 	false},							// decrement null reduction when king is in danger
+ 	{"NNUEeval",				true,  	false},							// use NNUE evaluation instead of classic eval
+ 	{"PrintStatistics",			false,	false}							// print search statistics
 };
 
 struct Par {															// Astimate's parameters
 	char	Name[30];													// name of the parameter
 	short	Val,Low,High,Change;}										// default, lower, upper value and change	
 
-Paras[96]	= {														
-	{"Hash",					256, 	1,  4096,  0},					// transposition table size (MB)
+Paras[107]	= {														
+	{"Hash",					128, 	1,  4096,  0},					// transposition table size (MB)
 	{"PawnTable",				 10, 	1,   100,  0},					// pawn hash table size (MB)
 	{"MaterialTable",			  1, 	1,     5,  0},					// material hash table size (MB)
-	{"EvaluationTable",			  2, 	1,     5,  0},					// evaluation hash table size (MB)
-	{"KingValue",			  10000,10000, 10000,  0},					// value of king	
-	{"QueenValue",				975,  500,  1500, 10},					// value of queen
-	{"RookValue",				500,  200,  1000, 10},					// value of rook
-	{"BishopValue",				325,  100,   800, 10},					// value of bishop
-	{"KnightValue",				325,  100,   800, 10},					// value of knight
-	{"PawnValue",				100,    0,   300, 10},					// value of pawn
+	{"EvaluationTable",			 10, 	1,   100,  0},					// evaluation hash table size (MB)
+	{"KingValue",			  10000,10000, 10000,  0},					// value of king opening	
+	{"QueenValueOpening",	   1980,    0,  3000, 10},					// value of queen opening 990, 2538
+	{"RookValueOpening",	   1000,    0,  2000, 10},					// value of rook opening 500, 1276
+	{"BishopValueOpening",		650,    0,  1600, 10},					// value of bishop opening 325, 825
+	{"KnightValueOpening",		650,    0,  1600, 10},					// value of knight opening 325, 781
+	{"PawnValueOpening",		200,    0,   600, 10},					// value of pawn opening 100, 126
 	
-	{"PairValue",				 50,    0,   200, 10},					// value of bishop pair
+	{"PairValue",				 70,    0,   200, 10},					// value of bishop pair 50
 	{"PST-Influence",			 10,    0,   100,  5},					// influence of pst table
-	{"SideToMoveBonus",			  5,    0,   100,  5},					// side to move bonus
+	{"SideToMoveBonus",			 10,    0,   100,  0},					// side to move bonus
 	{"GeneralPawnKingDist",		  1,	0,	  10,  1},					// general pawn-king distance
 	{"PawnChains",				  7,	0,	  20,  1},					// pawn chains
 	{"PawnPhallanx",			  5,	0,	  20,  1},					// pawn phallanx
@@ -164,7 +201,7 @@ Paras[96]	= {
 	{"PassedPawnKingDist",		  2,    0,    20,  1},					// passed pawn king distance
 	{"PassedPawnOpening",		  1,	0,	  20,  1},					// passed pawn general opening bonus
 	{"PassedPawnEndgame",		  4,	0,	  20,  1},					// passed pawn general endgame bonus	
-	{"ConnectedPassers(inv.)",	  4,    1,	  20,  1},					// connected passed pawns (inverse)
+	{"ConnectedPassers",	  	  2,    0,	  20,  1},					// connected passed pawns
 	{"CandidatePawnKingDist",	  1,    0,    20,  1},					// distance candidate pawn to king
 	{"CandidatePawnOpening",	  1,    0,	  20,  1},					// general candidate pawn opening bonus
 	
@@ -173,7 +210,7 @@ Paras[96]	= {
 	{"PassedPawnTelestop",		  5,	0,	  20,  1},					// passed pawn telestop
 	{"PassedPawnStop",			  5,	0,	  20,  1},					// passed stop
 	{"PasserRaceBonus",			125,	0,	 500, 10},					// race bonus 
-	{"PasserFreePath",			 50,	0,	 300, 10},					// free path for passed pawn outside Berger
+	{"PasserFreePath",			 90,	0,	 300, 10},					// free path for passed pawn outside Berger
 	{"PasserStopAttacked",		  5,	0,	  20,  1},					// stop square attacked
 	{"BishopControlsStop",		  5, 	0,	  20,  1},					// bishop controls stop square
 	{"VerticalOpposition",		 10,	0,	 100,  5},					// vertical opposition
@@ -183,14 +220,14 @@ Paras[96]	= {
 	{"PinnedPieces",			  5,    0,    20,  1},					// malus for pinned pieces
 	{"DiscoveredCheck",		  	  0,    0,    20,  1},					// discovered check pieces
 	{"OfficersAttacked",		  5,	0,	  50,  1},					// count attacks on officers
-	{"KingAttacked",			  5,	0,	  50,  1},					// count attacks on king
+	{"KingAttacked",			  8,	0,	  50,  1},					// count attacks on king
 	{"WeakPawnAttacked",		  5,	0,	  50,  1},					// count attacks on weak pawns
-	{"QueenMobility",			  2,	0,	  20,  1},					// count queen moves
+	{"QueenMobility",			  3,	0,	  20,  1},					// count queen moves
 	{"TrappedQueen",			 20,	0,   200,  5},					// malus for trapped queen
-	{"RookMobility",			  2,	0,	  20,  1},					// count rook moves
+	{"RookMobility",			  3,	0,	  20,  1},					// count rook moves
 	{"TrappedRook",			 	 10,	0,   200,  5},					// malus for trapped rook
 	
-	{"BishopMobility",			  2,	0,	  20,  1},					// count bishop moves
+	{"BishopMobility",			  3,	0,	  20,  1},					// count bishop moves
 	{"TrappedBishop",			 10,	0,   200,  5},					// malus for trapped bishop
 	{"KnightMobility",			  2,	0,	  20,  1},					// count knight moves
 	{"TrappedKnight",			 10,	0,   200,  5},					// malus for trapped knight
@@ -216,170 +253,227 @@ Paras[96]	= {
 	{"CastlesDone",		     	  5,	0,	  50,  1},					// castles done
 	{"BishopOnh7Opening",	    150,	0,	 300, 10},					// bishop trapped on h7 opening
 	{"BishopOnh7Endgame",		 50,	0,	 300, 10},					// bishop trapped on h7 endgame
-	{"DrawScore",				  0,    0,  1000, 10},					// draw score. 500=0
-	{"Depth1Pruning",			235,	0,	1200, 10},					// pruning at depth 1
-	{"Depth2Pruning",			450,	0,  1200, 10},					// pruning at depth 2
-	{"Depth3Pruning",			625,	0,  1200, 10},					// pruning at depth 3
-	{"Depth4Pruning",		   1125,	0,	1200, 10},					// pruning at depth 4
-	{"Q-PruningMiddlegame",		 80,	0,	 500, 10},					// quiescence pruning middlegame
+	{"DrawScore",				  0,    0,  1000,  0},					// draw score. 500=0
+	{"Depth1Pruning",			470,	0,	2400,  0},					// pruning at depth 1, 235
+	{"Depth2Pruning",			900,	0,  2400,  0},					// pruning at depth 2, 450
+	{"Depth3Pruning",		   1250,	0,  2400,  0},					// pruning at depth 3, 625
+	{"Depth4Pruning",		   2250,	0,	2400,  0},					// pruning at depth 4, 1125
+	{"Q-PruningMiddlegame",		160,	0,	1000,  0},					// quiescence pruning middlegame, 80
 	
-	{"Q-PruningEndgame",		180,	0,   500, 10},					// quiescence pruning endgame
-	{"ChecksInQsearch",			  1,	0,	  10,  1},					// check in quiescence search
-	{"NullmoveReduction",		  4,	0,	   6,  1},					// nullmove reduction 4
-	{"MulticutReduction",		  3,	0,	   6,  1},					// multicut reduction 3
-	{"IIDReduction",			  4,	0,	   6,  1},					// internal iterative deepening reduction 4
-	{"DeepsearchThreshold",		150,    0,  1000, 10},					// nullmove deepsearch threshold
-	{"MulticutCount",			  6,	4,   100,  1},					// number of multicut moves to check
-	{"MulticutSuccess",			  3,	1,	  10,  1},					// number of successful multi cuts
-	{"LMRReduction",			  6,    0,    10,  1},					// LMR reduction
-	{"AspirationMargin",		 50,    0,	 200, 10},					// size of aspiration window
+	{"Q-PruningEndgame",		180,	0,   500,  0},					// quiescence pruning endgame
+	{"ChecksInQsearch",			  1,	0,	  10,  0},					// check in quiescence search
+	{"NullmoveReduction",		  4,	0,	   6,  0},					// nullmove reduction 4
+	{"MulticutReduction",		  3,	0,	   6,  0},					// multicut reduction 3
+	{"IIDReduction",			  4,	0,	   6,  0},					// internal iterative deepening reduction 4
+	{"DeepsearchThreshold",		150,    0,  1000,  0},					// nullmove deepsearch threshold
+	{"MulticutCount",			  6,	4,   100,  0},					// number of multicut moves to check
+	{"MulticutSuccess",			  3,	1,	  10,  0},					// number of successful multi cuts
+	{"LMRReduction",			  6,    0,    10,  0},					// LMR reduction
+	{"AspirationMargin",		100,    0,	 200,  0},					// size of aspiration window, 50
 	
-	{"SuddenDeathMoves",		 30,	1,	 200,  1},					// estimated number of moves to go
-	{"SuddenDeathWInc",			  7,	1,	 200,  1},					// sudden death moves to go with increment
-	{"HardBreakTimeFactor",		  5,	1,	  20,  1},					// stop calculation after x times planned time
+	{"SuddenDeathMoves",		 50,	1,	 200,  0},					// estimated number of moves to go
+	{"SuddenDeathWInc",			  7,	1,	 200,  0},					// sudden death moves to go with increment
+	{"HardBreakTimeFactor",		  2,	1,	  20,  0},					// stop calculation after x times planned time
 	{"HelperThreads",			  3, 	0,	  50,  0},					// number of helper threads
 	{"LMRBadMoveReduction",		  2,    0,     3,  0},					// reduction for bad moves
-	{"PromotionPruning",		800,  500,	1500,  0}					// promotion pruning value in Qsearch
+	{"PromotionPruning",	   1600,  500,	3000,  0},					// promotion pruning value in Qsearch, 800
+	{"HistoryMoves",			  8,    0,   100,  0},					// number of history moves to consider
+	{"HistoryPlies",			  8,    0,   100,  0},					// ply up to which history tables are used
+	{"MultiPV",					  0,	0,	  10,  0},					// Number of PVs in Multi-PV Mode
+	{"HangingPieces",			  3,    0,    50,  1},					// bonus for hanging pieces
+	
+	{"KingValueEndgame",	  10000,10000, 10000,  0},					// value of king endgame
+	{"QueenValueEndgame",	   1980,    0,  3000, 10},					// value of queen endgame, 2682
+	{"RookValueEndgame",	   1000,    0,  2000, 10},					// value of rook endgame, 1380
+	{"BishopValueEndgame",		650,    0,  1600, 10},					// value of bishop endgame, 915
+	{"KnightValueEndgame",		650,    0,  1600, 10},					// value of knight endgame,854
+	{"PawnValueEndgame",		200,    0,   600, 10},					// value of pawn endgame, 208
+	{"NNUEScaleFactor",			 24,	1,	 100,  0}					// divider for NNUE evaluations
 };
 
-short 	Maxply,(*recog[1024])(Game*,Byte*);								// recognition function pointers
-Byte 	*hash_t,*phash_t,*mhash_t,*ehash_t,level,maxdepth,nmate;		// transposition-,pawn-,material and evaluation hash table
-BitMap	HEN,PEN,MEN,EEN,DEN,HASHFILL,ALLNODES,MAXNODES;             	// number of transposition table entries
-Dbyte	Pv[PVN],Movestogo;									            // maximal ply, pv table	
-clock_t StartTime;														// start time of calculation
-Fbyte	Tmax,Wtime,Btime,Winc,Binc,Movetime;							// time variables										
-volatile bool Stop,Ponder;												// stop calculation, ponder mode
-volatile short Malpha,Mbeta;
-volatile Byte midepth;
+// Global variables
 
-Dbyte	Line[]={0x0900,0x363F,0x1109,0x2E36,0x1A11,0x2D2E,0x221A,0x252D,0x2B22,0x2D25,0x8088,0x352D,0x3600,0x3635};
+short 			(*recog[1024])(Game*,Byte*);							// recognition function pointers
+Byte 			*hash_t,*phash_t,*mhash_t,*ehash_t;						// transposition-,pawn-,material and evaluation hash table
+BitMap	        HEN,PEN,MEN,EEN,DEN,HASHFILL,ALLNODES,MAXNODES;         // number of transposition table entries
+BitMap	        TTACC,TTHIT1,TTHIT2,TTCUT,TTHLPR;						// table hits and cuts
 
-void	SetGlobalDefaults();											// set global variables to initial defaults
-void 	InitDataStructures();											// initialize basic data structures
-void 	InitNewGame(Game*);												// initialize a new game
-void 	ClearTables();													// clear all hashtables
-void 	*ScanInput(void*);												// scan ascii input
-void 	ParseFen(Game*,char*);											// scans fen string and sets all variables
-void	GetPosition(Game*,char*);										// reads a psosition from input
-bool 	TestCheck(Game*,Byte);											// test for check on square k
-bool 	TestMCheck(Game*,Mvs*,Dbyte);									// move may announce check?
-bool 	TestAttk(Game*,Byte,Byte,Byte);									// does piece attack higher piece on square?	
-void 	GenMoves(Game*, Mvs*);											// generate moves
-Dbyte 	CodeMove(Game*,char*);											// get move as number
-void 	UncodeMove(Dbyte,char*);										// get move as string
-bool	TestLine(Game*,Byte);											// test sequence of moves
-void 	Move(Game*,Dbyte);												// make a move
-void 	UnMove(Game*);													// take back move
-Dbyte 	PickMove(Game*,Mvs*);											// pick moves from movelist
-void 	Perft(Game*,Byte);												// get Perft(d) of position				
-void 	*PerftCount(void*);												// recursive node counting
-void 	Divide(Game*,Byte);												// print divide of position
-void 	StoreHashP(Game*,BitMap);										// store entry in perft table
-BitMap 	GetHashP(Game*);												// get entry from perft table
-BitMap 	GetHash(Game*);													// get entry from transposition table
-void	StoreHash(Game*,short,Dbyte,Byte,Byte);							// store transposition information
-void 	PrintBM(BitMap);												// print bitmap
-short	Popcount(BitMap);												// count set bits in bitmap
-Dbyte	Book(Game*);													// check opening books
-bool 	DrawTest(Game*);												// position is draw?	
-bool 	SEE(Game*,Dbyte,short);											// SEE of current move larger than threshold
-void	PrintMoves(Game*);												// print all legal moves
-void	PrintPosition(Game*);											// print board
-short 	MatEval(Game*);													// material evaluation
-short 	Evaluation(Game*,Mvs*,short,short);								// evaluation
-short	Qsearch(Game*,short,short,Byte);								// quiescence search
-short	Search(Game*,short,short,Byte,Dbyte*);							// recursive negamax search
-void	*SmpSearchHelper(void*);										// smp search helper thread
-void	*SmpSearch(void*);												// smp main seach thread
-void	IterateSearch(Game*);											// find a best move
-void 	GetPV(Game*);													// retrieve principal variation
-void 	PrintPV(Game*,short,short,short);								// print PV
-void 	PrintCurrent(Game*,Dbyte,Dbyte);								// prints current move
+Dbyte	        				Movestogo,level,maxdepth,nmate;			// Number of moves to go												
+Fbyte	        				Tmax,Wtime,Btime,Winc,Binc,Movetime;	// time variables																					
+volatile 		short 			Malpha,Mbeta,Mval;						// search values for helpers
+volatile 		Byte 			midepth;								// search depths for helpers
 
-short 	NoRecog(Game*,Byte*);											// no recognizer found
-short 	KvK(Game*,Byte*);												// KvK endgame recognition function
-short 	KPvK(Game*,Byte*);
-short 	KvKP(Game*,Byte*);
-short 	KNvK(Game*,Byte*);
-short 	KvKN(Game*,Byte*);
-short 	KBvK(Game*,Byte*);
-short 	KvKB(Game*,Byte*);
-short 	KRvK(Game*,Byte*);
-short 	KvKR(Game*,Byte*);
-short 	KQvK(Game*,Byte*);
-short 	KvKQ(Game*,Byte*);
-short 	KBNvK(Game*,Byte*);
-short 	KvKBN(Game*,Byte*);
-short 	KNPvK(Game*,Byte*);
-short 	KvKNP(Game*,Byte*);
-short 	KBPvK(Game*,Byte*);
-short 	KvKBP(Game*,Byte*);
-short 	KPvKB(Game*,Byte*);
-short 	KBvKP(Game*,Byte*);
-short 	KPvKN(Game*,Byte*);
-short 	KNvKP(Game*,Byte*);	
-short 	KQvKP(Game*,Byte*);
-short 	KPvKQ(Game*,Byte*);
-short 	KPvKP(Game*,Byte*);
-short 	KRBvKR(Game*,Byte*);
-short 	KRvKRB(Game*,Byte*);
-short 	KRNvKR(Game*,Byte*);
-short 	KRvKRN(Game*,Byte*);
-short 	KBvKB(Game*,Byte*);
-short 	KNvKN(Game*,Byte*);
-short 	KRvKR(Game*,Byte*);
-short 	KQvKQ(Game*,Byte*);
-short 	KBPvKB(Game*,Byte*);
-short 	KBvKBP(Game*,Byte*);
-short 	KNPvKB(Game*,Byte*);
-short 	KBvKNP(Game*,Byte*);
-short 	KRvKB(Game*,Byte*);
-short 	KBvKR(Game*,Byte*);
-short 	KRvKN(Game*,Byte*);
-short 	KNvKR(Game*,Byte*);
-short 	KBvKN(Game*,Byte*);
-short 	KNvKB(Game*,Byte*);	
-short 	KRvKP(Game*,Byte*);
-short 	KPvKR(Game*,Byte*);
-short 	KRPvKR(Game*,Byte*);
-short 	KRvKRP(Game*,Byte*);
+volatile 		Byte			Stop,Ponder;
+
+volatile 		BitMap 			HISTORY[2][6][64][6][64];				// counter history table
+
+clock_t         StartTime;												// start time of calculation
+Dbyte			Line[]={0x0000};										// test line for debugging
+
+int32_t			NNUE_V;													// nnue network NNUE_V			(halfka: 0x7AF32F20)
+int16_t 		Biases		[512] 	 	__attribute__((aligned(64)));	// nnue transformer biases 		(halfka: 512)
+int16_t			Weights	 	[23068672]  __attribute__((aligned(64)));	// nnue transformer weights 	(halfka: 512x11x64x64)
+int32_t			PSQTweights	[360448]	__attribute__((aligned(64)));	// piece-square-table weights 	(halfka: 8x11x64x64)
+int32_t			L1biases	[128]		__attribute__((aligned(64)));	// layer stack level 1 biases 	(halfka: 8x16)
+int32_t			L2biases	[256]		__attribute__((aligned(64)));	// layer stack level 2 biases 	(halfka: 8x32)
+int32_t			L3biases	[8]			__attribute__((aligned(64)));	// layer stack level 3 biases 	(halfka: 8x1)
+int8_t			L1weights	[131072]	__attribute__((aligned(64)));	// layer stack level 1 weights 	(halfka: 8x16x1024)	
+int8_t			L2weights	[8192]		__attribute__((aligned(64)));	// layer stack level 2 weights 	(halfka: 8x32x32)
+int8_t			L3weights	[256]		__attribute__((aligned(64)));	// layer stack level 3 weights 	(halfka: 8x32)
+
+void			SetGlobalDefaults();									// set global variables to initial defaults
+void 			InitDataStructures();									// initialize basic data structures
+void 			InitNewGame(Game*);										// initialize a new game
+void 			ClearTables();											// clear all hashtables
+void 			*ScanInput(void*);										// scan ascii input
+double			Speed(Game*,Byte);										// speed test
+void 			ParseFen(Game*,char*);									// scans fen string and sets all variables
+void			GetPosition(Game*,char*);								// reads a psosition from input
+bool 			TestCheck(Game*,Byte);									// test for check on square k
+bool 			TestMCheck(Game*,Mvs*,Dbyte);							// move may announce check?
+bool 			TestAttk(Game*,Byte,Byte,Byte);							// does piece attack higher piece on square?	
+void 			GenMoves(Game*, Mvs*);									// generate moves
+Dbyte 			CodeMove(Game*,char*);									// get move as number
+void 			UncodeMove(Dbyte,char*);								// get move as string
+bool			TestLine(Game*,Byte);									// test sequence of moves
+void 			Move(Game*,Dbyte);										// make a move
+void 			UnMove(Game*);											// take back move
+Dbyte 			PickMove(Game*,Mvs*);									// pick moves from movelist
+void 			Perft(Game*,Byte);										// get Perft(d) of position				
+void 			*PerftCount(void*);										// recursive node counting
+void 			Divide(Game*,Byte);										// print divide of position
+void 			StoreHashP(Game*,BitMap);								// store entry in perft table
+BitMap 			GetHashP(Game*);										// get entry from perft table
+BitMap 			GetHash(Game*);											// get entry from transposition table
+void			StoreHash(Game*,short,Dbyte,Byte,Byte);					// store transposition information
+void 			PrintBM(BitMap);										// print bitmap
+short			Popcount(BitMap);										// count set bits in bitmap
+Dbyte			Book(Game*);											// check opening books
+bool 			DrawTest(Game*);										// position is draw?	
+bool 			SEE(Game*,Dbyte,short);									// SEE of current move larger than threshold
+void			PrintMoves(Game*);										// print all legal moves
+void			PrintPosition(Game*,NNUE*);								// print board
+short 			MatEval(Game*);											// material evaluation
+short 			Evaluation(Game*,NNUE*,Mvs*,short,short);				// evaluation
+short			Qsearch(Game*,NNUE*,short,short,Byte);					// quiescence search
+short			Search(Game*,NNUE*,short,short,Byte,Dbyte*);			// recursive negamax search
+void			*SmpSearchHelper(void*);								// smp search helper thread
+void			*SmpSearch(void*);										// smp main seach thread
+void			*SmpSpeedHelper(void*);									// smp speed test helper thread
+void			IterateSearch(Game*);									// find a best move
+void			FindMate(Game*);										// finde mate in n
+void			*SmpMateHelper(void*);									// smp mate search
+short			MateSearch(Game*,short,short,Byte);						// mate search
+void 			GetPV(Game*);											// retrieve principal variation
+void 			PrintPV(Game*,short,short,short);						// print PV
+void			PrintStats();											// print search statistics
+void 			PrintCurrent(Game*,Dbyte,Dbyte);						// prints current move
+double			CompareEval(char*,short,int);							// compares static evaluation with eval in csv dataset
+void			ParseParameters(char*,int);								// test possible parameter changes
+void			DebugEval(Game*);										// debug evaluation parameters
+bool			NNUE_InitNetwork(FILE*);								// initialize NNUE evaluation function network
+void			NNUE_InitFeatures(Game*,NNUE*,Byte);					// initialize NNUE feature vector
+void			NNUE_UpdateFeatures(Game*,NNUE*);						// update NNUE features after move
+short			NNUE_Evaluate(Game*,NNUE*);								// NNUE evaluation
+
+void			NNUE_SpeedTest(Game*,NNUE*);
+
+short 			NoRecog(Game*,Byte*);									// no recognizer found
+short 			KvK(Game*,Byte*);										// KvK endgame recognition function
+short 			KPvK(Game*,Byte*);
+short 			KvKP(Game*,Byte*);
+short 			KNvK(Game*,Byte*);
+short 			KvKN(Game*,Byte*);
+short 			KBvK(Game*,Byte*);
+short 			KvKB(Game*,Byte*);
+short 			KRvK(Game*,Byte*);
+short 			KvKR(Game*,Byte*);
+short 			KQvK(Game*,Byte*);
+short 			KvKQ(Game*,Byte*);
+short 			KBNvK(Game*,Byte*);
+short 			KvKBN(Game*,Byte*);
+short 			KNPvK(Game*,Byte*);
+short 			KvKNP(Game*,Byte*);
+short 			KBPvK(Game*,Byte*);
+short 			KvKBP(Game*,Byte*);
+short 			KPvKB(Game*,Byte*);
+short 			KBvKP(Game*,Byte*);
+short 			KPvKN(Game*,Byte*);
+short 			KNvKP(Game*,Byte*);	
+short 			KQvKP(Game*,Byte*);
+short 			KPvKQ(Game*,Byte*);
+short 			KPvKP(Game*,Byte*);
+short 			KRBvKR(Game*,Byte*);
+short 			KRvKRB(Game*,Byte*);
+short 			KRNvKR(Game*,Byte*);
+short 			KRvKRN(Game*,Byte*);
+short 			KBvKB(Game*,Byte*);
+short 			KNvKN(Game*,Byte*);
+short 			KRvKR(Game*,Byte*);
+short 			KQvKQ(Game*,Byte*);
+short			KQvKR(Game*,Byte*);
+short			KRvKQ(Game*,Byte*);
+short 			KBPvKB(Game*,Byte*);
+short 			KBvKBP(Game*,Byte*);
+short 			KNPvKB(Game*,Byte*);
+short 			KBvKNP(Game*,Byte*);
+short 			KRvKB(Game*,Byte*);
+short 			KBvKR(Game*,Byte*);
+short 			KRvKN(Game*,Byte*);
+short 			KNvKR(Game*,Byte*);
+short 			KBvKN(Game*,Byte*);
+short 			KNvKB(Game*,Byte*);	
+short 			KRvKP(Game*,Byte*);
+short 			KPvKR(Game*,Byte*);
+short 			KRPvKR(Game*,Byte*);
+short 			KRvKRP(Game*,Byte*);
+
+void			PrintVector(void*,Byte);
 
 int 	main()
 {
  Game		Gm;
  Mvs		Mv;
+ NNUE		Nn;
  Byte		i,j,d;
  Dbyte		Mov;
  char 		Com[50],Pos[100],*Is;
- int		Iv;
+ int		Iv,n,m;
  clock_t 	t1;
  BitMap		BM;
- 
- char		Testpos[]="fen 8/5p1p/1p2pPk1/2p1P3/PpP1K2b/4B3/7P/8 w - - 0 2 "; 
+ double		sp,eff;
+ FILE		*fp;
  
  struct 	Inp {char Str[5000]; Byte volatile inp;} Input={" ",0};		// structure for user/GUI input  
  pthread_t	Tid0; 														// thread ID for user input
- 
  pthread_create(&Tid0, NULL, ScanInput, (void*)(&Input));				// create the thread for ascii input	   
- InitDataStructures();													// initialize global data
- //GetPosition(&Gm,Startpos); strcpy(Pos,Startpos);						// default is startpos
+ InitDataStructures();	InitNewGame(&Gm);								// initialize global data
+ GetPosition(&Gm,Startpos); strcpy(Pos,Startpos);						// default is startpos
+ SetGlobalDefaults();													// set global variables to default values
+ if(Options[8].Val)														// NNUE enabled?
+ { 
+  if(fp=fopen("network.nnue","rb"))										// try to open nnue file
+   {if(!NNUE_InitNetwork(fp)) Options[8].Val=false; fclose(fp);}		// try to process nnue file
+  else Options[8].Val=false;											// do not use nnue evaluation 													
+ }
+ if(Options[8].Val) NNUE_InitFeatures(&Gm,&Nn,3);			            // initialize NNUE features
  
- GetPosition(&Gm,Testpos); strcpy(Pos,Testpos);
+ //NNUE_SpeedTest(&Gm,&Nn);
  
- SetGlobalDefaults();													// set global variables to default values														
-
  while(1)
  {
-  usleep(10000);														// sleep 1/100s to prevent busy thread
+  while(!Input.inp) usleep(1000);	    								// sleep 1/1000s to prevent busy thread
+  //if(Input.inp>49) Options[0].Val=0;                                   // terminal mode (no UCI) recognized
   switch(Input.inp)														// main program loop
   {
    case 0:  break;
-   case 1:	printf("readyok\n"); fflush(stdout); 						// default answer to ping "isready"
-   											Input.inp=0; 	break;										
+   case 1:	printf("readyok\n"); fflush(stdout); Input.inp=0; 	break;	// default answer to ping "isready"																		
    case 2:  free(hash_t); free(phash_t); free(mhash_t); free(ehash_t);	// free hash table space
-   			pthread_exit(NULL); 			Input.inp=0;	break;		// "quit" command from GUI
+   			return(0); 													// "quit" command from GUI
    case 3:  strncpy(Pos,Input.Str+13,100);
-   			GetPosition(&Gm,Input.Str);		Input.inp=0;	break;		// get position and moves
+   			GetPosition(&Gm,Input.Str);	
+			if(Options[8].Val) NNUE_InitFeatures(&Gm,&Nn,3);            // init NNUE features
+			                            Input.inp=0;			break;	// get position and moves
    case 4:	printf("id name Astimate3\n");								// answer to "uci" request from GUI
 		    printf("id author Dr. Axel Steinhage, Germany, 2021\n"); 	// engine and author name 
 		    printf("option name ClearTT type button\n");				// Clear hash table button
@@ -393,41 +487,67 @@ int 	main()
 		     printf("option name %s type spin default %d min %d max %d\n",
 			  Paras[i].Name,Paras[i].Val,Paras[i].Low,Paras[i].High);
 			printf("uciok\n"); 											// this is an UCI engine
-		    fflush(stdout); 				Input.inp=0;	break;
+		    fflush(stdout); 				Input.inp=0;		break;
    case 5:	maxdepth=level=nmate=0; MAXNODES=0;	Input.inp=0;			// "go" command from GUI
-			Wtime=Btime=Winc=Binc=Movetime=0; Movestogo=0;				// initialize values							
+			Wtime=Btime=Winc=Binc=Movetime=0; Movestogo=0;				// initialize values
+			if((Is=strstr(Input.Str,"searchmoves")))					// search only selected moves?
+			{
+			 i=0; while((Gm.Root[i]).Mov) 								// check all possible root moves
+			 {
+			  UncodeMove((Gm.Root[i]).Mov,Com);							// get move as string
+			  if(!strstr(Input.Str,Com)) (Gm.Root[i]).flags|=4; 		// move not in the list: exclude
+			  else (Gm.Root[i]).flags&=0xFB; 							// move in the list: 
+			  i++;
+			 }
+			}
     		if((Is=strstr(Input.Str,"ponder"))) 
 								Ponder=true; else Ponder=false;			// Ponder?
 		    if((Is=strstr(Input.Str,"wtime"))) 
-								sscanf(Is,"%s %d",Com,&Wtime);			// white time left
+								sscanf(Is,"%s %ld",Com,&Wtime);			// white time left
 		    if((Is=strstr(Input.Str,"btime"))) 
-								sscanf(Is,"%s %d",Com,&Btime);			// black time left
+								sscanf(Is,"%s %ld",Com,&Btime);			// black time left
 		    if((Is=strstr(Input.Str,"winc")))  
-								sscanf(Is,"%s %d",Com,&Winc);			// white increment
+								sscanf(Is,"%s %ld",Com,&Winc);			// white increment
 		    if((Is=strstr(Input.Str,"binc")))  
-								sscanf(Is,"%s %d",Com,&Binc);			// black increment
+								sscanf(Is,"%s %ld",Com,&Binc);			// black increment
 		    if((Is=strstr(Input.Str,"movestogo"))) 
-								sscanf(Is,"%s %d",Com,&Movestogo);		// moves to go
+								sscanf(Is,"%s %hu",Com,&Movestogo);		// moves to go
 			else level=2;												// sudden death
 		    if((Is=strstr(Input.Str,"depth"))) 							// fixed depth
-			 		{level=3; sscanf(Is,"%s %c",Com,&maxdepth);}
+			 		{level=3; sscanf(Is,"%s %hu",Com,&maxdepth);}
 		    if((Is=strstr(Input.Str,"nodes"))) 							// max nodes
 			 		{level=4; sscanf(Is,"%s %llu",Com,&MAXNODES);}
 		    if((Is=strstr(Input.Str,"mate")))  							// mate search
-			 		{level=5; sscanf(Is,"%s %c",Com,&nmate);}
+			 		{level=5; sscanf(Is,"%s %hu",Com,&nmate);}
 		    if((Is=strstr(Input.Str,"movetime"))) 						// exact time per move
-			 		{level=6; sscanf(Is,"%s %d",Com,&Movetime);}
+			 		{level=6; sscanf(Is,"%s %ld",Com,&Movetime);}
 		    if((Is=strstr(Input.Str,"infinite"))) level=1;				// infinite
-		    IterateSearch(&Gm);											// start search
-		    if((level==1)||(Ponder)) while(!Stop);						// do not stop in pondering or analysis mode
+		    if(nmate) FindMate(&Gm); else IterateSearch(&Gm);			// start search
+		    while(Ponder); 												// do not return while in ponder mode
 		    UncodeMove(Gm.Move2Make,Com);								// get best move
-		    printf("bestmove %s ",Com);
+		    if(!(Options[0].Val))                                       // terminal mode
+		    {
+		     if((Mov=CodeMove(&Gm,Com)))							    // make move
+   			 {
+			  Move(&Gm,Mov); 
+			  if(Options[8].Val) NNUE_UpdateFeatures(&Gm,&Nn);			// move and update NNUE features 
+			  Gm.Move_r=Gm.Move_n;										// set root move number
+              GenMoves(&Gm,&Mv);										// generate moves
+              Mv.o=Mv.flg=i=0; Mv.s=200; 								// init move picker
+              while((Gm.Root[i]).Mov=PickMove(&Gm,&Mv)) 
+               {(Gm.Root[i]).Order=1; (Gm.Root[i]).flags=0; i++;}	    // fill root move list	
+			  PrintPosition(&Gm,&Nn);  									// show new position
+			 }						
+   		     else printf("illegal move!\n");	Input.inp=0; 	break;	// wrong move
+   		    }	
+		    printf("bestmove %s ",Com); 
 		    if(Gm.Pmove) 												// ponder move exists
 			 {UncodeMove(Gm.Pmove,Com); printf("ponder %-7s",Com);}		// get ponder move
-			printf("\n"); fflush(stdout);					break; 
-   case 7:	InitNewGame(&Gm); 				Input.inp=0; 	break;		// prepare new game
+			printf("\n"); fflush(stdout);					
+			for(BM=0;BM<2*HEN;BM++) hash_t[16*BM+1]|=0x08;		break;	// set age flag 
+   case 7:	InitNewGame(&Gm); 				Input.inp=0; 		break;	// prepare new game
    case 8:	if(strstr(Input.Str,"ClearTT")) 							// clear hash tables
-   							{ClearTables();	Input.inp=0;	break;}
+   							{ClearTables();	Input.inp=0;		break;}
    			for(i=1;i<sizeof(Options)/sizeof(Options[0]);i++)			// scan options
    			 if(Is=strstr(Input.Str,Options[i].Name))					// option found
    			  if(strstr(Input.Str,"true")) 	Options[i].Val=true;
@@ -459,29 +579,48 @@ int 	main()
 				  default: break;
 				 }
 				}
-   											Input.inp=0; 	break;
+   											Input.inp=0; 		break;
    case 50: sscanf(Input.Str,"%s %d",Com,&d); Input.inp=0;				// get parameters
-  			Perft(&Gm,d); 									break;		// perft 			
+  			Perft(&Gm,d); 										break;	// perft 			
    case 51: sscanf(Input.Str,"%s %d",Com,&d); Input.inp=0;				// get parameters
-  			Divide(&Gm,d);									break;		// divide
-   case 52: PrintMoves(&Gm);				Input.inp=0;	break;		// print all legal moves
-   case 53: PrintPosition(&Gm); 			Input.inp=0; 	break;		// print board
+  			Divide(&Gm,d);										break;	// divide
+   case 52: PrintMoves(&Gm);				Input.inp=0;		break;	// print all legal moves
+   case 53: PrintPosition(&Gm,&Nn); 	 	Input.inp=0; 		break;	// print board
+   case 54: sscanf(Input.Str,"%s %s %d %d",Com,Com,&m,&n); Input.inp=0;	// get csv filename and eval limit
+			CompareEval(Com,m,n);								break;	// get eval difference
+   case 55: sscanf(Input.Str,"%s %s %d",Com,Com,&n); Input.inp=0;		// get csv filename and eval limit
+			ParseParameters(Com,n);								break;	// parse parameters for optimization			
    case 56: if((Mov=CodeMove(&Gm,Input.Str)))							// make move
-   			 {Move(&Gm,Mov); PrintPosition(&Gm);}						// show new position
-   		    else printf("illegal move!\n");	Input.inp=0; 	break;		// wrong move																
+   			{
+			 Move(&Gm,Mov); 
+			 if(Options[8].Val) NNUE_UpdateFeatures(&Gm,&Nn);			// move and update NNUE features 
+			 Gm.Move_r=Gm.Move_n;										// set root move number
+             GenMoves(&Gm,&Mv);											// generate moves
+             Mv.o=Mv.flg=i=0; Mv.s=200; 								// init move picker
+             while((Gm.Root[i]).Mov=PickMove(&Gm,&Mv)) 
+              {(Gm.Root[i]).Order=1; (Gm.Root[i]).flags=0; i++;}	    // fill root move list	
+			 PrintPosition(&Gm,&Nn);  									// show new position
+			}						
+   		    else printf("illegal move!\n");	Input.inp=0; 		break;	// wrong move																
    case 57: if((j=Gm.Move_n))											// take back move
    			{
-			 ParseFen(&Gm,Pos);											// setup initial position
-			 for(i=0;i<j-1;i++)	Move(&Gm,(Gm.Moves[i]).Mov);			// parse moves made
+			 ParseFen(&Gm,Pos);	
+			 if(Options[8].Val) NNUE_InitFeatures(&Gm,&Nn,3);           // setup initial position and initialize NNUE features
+			 for(i=0;i<j-1;i++)	
+			 {
+			  Move(&Gm,(Gm.Moves[i]).Mov); 
+			  if(Options[8].Val) NNUE_UpdateFeatures(&Gm,&Nn);          // parse moves made
+		     }
 		    }
-			PrintPosition(&Gm); 			Input.inp=0; 	break;		// show new position	
-   case 58: t1=clock();	printf("testing speed:\n");						// speedtest
-   			for(BM=0;BM<10000000;BM++)
+			PrintPosition(&Gm,&Nn); 		Input.inp=0; 		break;	// show new position	
+   case 58: printf("testing speed:\n"); eff=100000;						// speedtest
+   			for(i=1;i<=10;i++) 											// testing efficiency of up to 10 threads
    			{
-   			 GenMoves(&Gm,&Mv);	
-   			}
-			printf("time: %lf\n",(double)(clock()-t1)/CLOCKS_PER_SEC); 
-												Input.inp=0; break;  			
+   			 sp=Speed(&Gm,i)/i; if(sp<eff) {eff=sp; j=i;}				// duration for 1 Mio move gens per thread
+			 printf("%d thread(s): %lf\n",i,sp);
+		    }
+			printf("I suggest %d helper threads\n",j-1);				// take one less for GUI etc
+												Input.inp=0; 	break;  			
   }
  }
  return(0);																// exit program
@@ -490,27 +629,33 @@ int 	main()
 void 	*ScanInput(void *Pe)											// scan user/GUI input
 {
  struct In {char Str[5000]; volatile Byte inp;} *Input;					// structure for user input
+ char*   c;
  
  Input=(struct In*)Pe;													// cast input pointer					 
  	
+ //setbuf(stdout, NULL); setbuf(stdin, NULL);
+ 
  while(1) 
  {
-  usleep(10000);
+  usleep(1000);															// sleep 1/10000s to prevent busy thread
   if(!(Input->inp))														// endless loop over input
   {
-   fgets(Input->Str,4999,stdin); 				Input->inp = 0;			// read standard input
+   c=fgets(Input->Str,4999,stdin);  		    Input->inp = 0;			// read standard input
    if(!strncmp(Input->Str,"isready",7)) 		Input->inp = 1;			// ping
    if(!strncmp(Input->Str,"quit",4)) 	  		Input->inp = 2;			// leave program
    if(!strncmp(Input->Str,"position",8)) 		Input->inp = 3;			// position and moves input
    if(!strncmp(Input->Str,"ucinewgame",10)) 	Input->inp = 7;			// new game
    else if(!strncmp(Input->Str,"uci",3)) 		Input->inp = 4;			// uci compatible?
    if(!strncmp(Input->Str,"go",2))  	   		Input->inp = 5;			// start calculating
-   if(!strncmp(Input->Str,"stop",4)) 	  		Stop=true;				// stop calculating	
+   if(!strncmp(Input->Str,"stop",4)) 	  	{Stop=true;	Ponder=false;}	// stop calculating
+   if(!strncmp(Input->Str,"ponderhit",9))		Ponder=false; 			// ponder move made
    if(!strncmp(Input->Str,"setoption",9))		Input->inp = 8;			// configure options
    if(!strncmp(Input->Str,"perft",5))   		Input->inp = 50;		// perft		
    if(!strncmp(Input->Str,"divide",6))  		Input->inp = 51;		// divided perft
    if(!strncmp(Input->Str,"list",4))  			Input->inp = 52;		// list moves
    if(!strncmp(Input->Str,"show",4))	 		Input->inp = 53;		// print board
+   if(!strncmp(Input->Str,"compare",7))			Input->inp = 54;		// compare static eval with eval in csv dataset
+   if(!strncmp(Input->Str,"optimize",7))		Input->inp = 55;		// check evaluation parameters for optimization
    if(isalpha(Input->Str[0]) && isdigit(Input->Str[1]) &&
       isalpha(Input->Str[2]) && isdigit(Input->Str[3]))
      							 				Input->inp = 56;		// move
@@ -523,29 +668,524 @@ void 	*ScanInput(void *Pe)											// scan user/GUI input
 
 void	SetGlobalDefaults()												// set global variables to initial default values
 {
- maxdepth=nmate=0; MAXNODES=0; level=6;	Ponder=false;					
+ maxdepth=nmate=0; MAXNODES=ALLNODES=0; level=6; Ponder=false;					
  Wtime=Btime=Winc=Binc=0; Movetime=10000; Movestogo=0;
+ Malpha=Mbeta=Mval=0; midepth=0;
+}
+
+void	*SmpSpeedHelper(void* Ms)
+{
+ Game*	Gm=(Game*)(Ms);
+ Mvs	Mv;
+ BitMap	BM;
+ 
+ for(BM=0;BM<1000000;BM++) GenMoves(Gm,&Mv);
+ 
+ return 0;
+}
+ 
+double	Speed(Game* Gm, Byte thr)
+{
+ Game		Gp[thr];
+ Byte		i;
+ clock_t	t1;
+
+ t1=clock();
+ for(i=0;i<thr;i++) 
+ {
+  Gp[i]=*Gm;	
+  pthread_create(&(Gp[i].Tid), NULL, SmpSpeedHelper, (void*)(Gp+i)); 
+ }
+ for(i=0;i<thr;i++) pthread_join(Gp[i].Tid,NULL);
+ return (double)(clock()-t1);	
+}
+
+bool 	NNUE_InitNetwork(FILE *fp)										// init NNUE network using file "network.nnue"
+{
+ int32_t	d;
+ char		c;
+ int		i;
+ 
+ if(fread(&NNUE_V,1,4,fp)!=4)					return false;			// read version					(1x					32 bit)
+ 
+ if(fread(&d,1,4,fp)!=4)						return false;			// read hash					(1x					32 bit)
+ if(fread(&d,1,4,fp)!=4)						return false;			// read size of description		(1x					32 bit)
+ for(i=0;i<d;i++) if(fread(&c,1,1,fp)!=1)		return false;			// read description				(dx				 	 8 bit)
+ if(fread(&d,1,4,fp)!=4)						return false;			// read hash					(1x					32 bit)
+
+ if(NNUE_V==0x7AF32F20u)												// new HalfkA_v2 version
+ {
+
+  if(fread(Biases,2,512,fp)!=512)				return false;			// read transformer biases		(512x				16 bit)
+  if(fread(Weights,2,23068672,fp)!=23068672)	return false;			// read transformer weights		(512x64x11x64  		16 bit)
+  if(fread(PSQTweights,4,360448,fp)!=360448)	return false;			// read PSQT weights			(  8x64x11x64  		32 bit)
+  for(i=0;i<8;i++)														// layer stack with 8 subnets
+  {
+   if(fread(&d,1,4,fp)!=4)						return false;			// read hash
+   if(fread(L1biases+    16*i,4,   16,fp)!=16)	return false;			// read layer biases			(16x				32 bit)
+   if(fread(L1weights+16384*i,1,16384,fp)!=16384) return false;			// read layer weights			(16x1024x			 8 bit)
+   if(fread(L2biases+    32*i,4,   32,fp)!=32)	return false;			// read layer biases			(32x				32 bit)
+   if(fread(L2weights+ 1024*i,1, 1024,fp)!=1024) return false;			// read layer weights			(32x32x				 8 bit) 16 (padded?)
+   if(fread(L3biases+       i,4,    1,fp)!=1)	return false;			// read layer bias				(1x					32 bit)
+   if(fread(L3weights+   32*i,1,   32,fp)!=32)	return false;			// read layer weights			(32x1x				 8 bit)
+  } 	
+  												return true;			// network successfully loaded
+ }
+ 												return false;			// unsupported version of nnue network file
+}
+
+void	NNUE_InitFeatures(Game* Gm, NNUE* Nn, Byte p)					// init NNUE feature vector
+{
+ int8_t		c,s,t,T,w,n,k;
+ int32_t	ks[2],i,j;
+ BitMap 	P,AP[2];
+ 
+ if(NNUE_V==0x7AF32F20u)												// new HalfKAv2 version
+ {
+  ks[0]=64*11*NNSQ[ (Gm->Officer[0][0]).square];						// white perspective
+  ks[1]=64*11*	 	(Gm->Officer[1][0]).square;							// black perspective (horizontal mirror/flip)
+  for(i=0;i<2;i++) 
+  {
+   AP[i]=Gm->POSITION[i][0];
+   if(p&(1<<i)) for(j=0;j<8;j++) Nn->F_psq[i][j]=0;						// clear psq feature vector of perspective
+  }		
+ }
+ 
+ #if 		defined(USE_AVX2)											// avx2 version
+  
+  __m256i  fv[32],psq,*we;
+  
+  for(k=0;k<2;k++) if(p&(1<<k))											// perspective
+  {
+   w=1-2*k; 
+   psq=_mm256_load_si256((__m256i*)(Nn->F_psq[k]));						// load psqt features 				  
+   for(j=0;j<32;j++) fv[j]=_mm256_load_si256((__m256i*)(Biases)+j);		// load biases
+   for(c=0;c<2;c++) 													// parse both colors
+   {
+ 	P=AP[c]; T=12+c+k-2*k*c; while(P)									// parse all pieces of color
+    {
+     s=find_b[(P^P-1)%67]; P&=P-1;										// square and type of piece
+     if((t=T-2*(Gm->Piece[c][s]).type)>10) t=10;						// halfka: wking=bking
+ 	 i=Nn->F_ind[k][s]=ks[k]+64*t+(w+k)*NNSQ[s]+k*s;					// save feature index
+ 	 we=(__m256i*)(Weights+512*i);
+	 for(j=0;j<32;j++) fv[j]=_mm256_add_epi16(fv[j],*(we+j));			// add weight of feature
+	 psq=_mm256_add_epi32(psq,*(__m256i*)(PSQTweights+8*i));			// add weight of piece square feature
+	}
+   }
+   for(j=0;j<32;j++) _mm256_store_si256((__m256i*)(Nn->F_vec[k])+j,fv[j]);// store features
+   _mm256_store_si256((__m256i*)(Nn->F_psq[k]),psq);					// store psqt features				
+  }
+  
+ #elif	defined(USE_NEON)
+ 
+  int16x8_t	fv[64],*we;
+  int32x4_t	psq1,psq2;
+  
+  for(k=0;k<2;k++) if(p&(1<<k))											// perspective and half of 256bit vector
+  {
+   w=1-2*k;
+   psq1=vld1q_s32(Nn->F_psq[k]); psq2=vld1q_s32(Nn->F_psq[k]+4);		// load psqt features 
+   for(j=0;j<64;j++) fv[j]=vld1q_s16(Biases+8*j);						// load biases	
+   for(c=0;c<2;c++) 													// parse both colors
+   {
+ 	P=AP[c]; T=12+c+k-2*k*c; while(P)									// parse all pieces of color
+    {
+     s=find_b[(P^P-1)%67]; P&=P-1;										// square and type of piece
+     if((t=T-2*(Gm->Piece[c][s]).type)>10) t=10;						// halfka: wking=bking
+ 	 i=Nn->F_ind[k][s]=ks[k]+64*t+(w+k)*NNSQ[s]+k*s;					// save feature index
+ 	 we=(int16x8_t*)(Weights+512*i);
+ 	 for(j=0;j<64;j++) fv[j]=vaddq_s16(fv[j],*(we+j));					// add weight of feature
+	 psq1=vaddq_s32(psq1,*(int32x4_t*)(PSQTweights+8*i));				// add weight of piece square feature first part
+	 psq2=vaddq_s32(psq2,*(int32x4_t*)(PSQTweights+8*i+4));				// add weight of piece square feature second part
+	}
+   }
+   for(j=0;j<64;j++) vst1q_s16(Nn->F_vec[k]+8*j,fv[j]);					// store features
+   vst1q_s32(Nn->F_psq[k],psq1);	vst1q_s32(Nn->F_psq[k]+4,psq2);		// store psq features 
+  }
+  
+ #else																	// generic version
+ 
+  for(k=0;k<2;k++) if(p&(1<<k))											// perspective
+  {
+   memcpy(Nn->F_vec[k],Biases,1024); w=1-2*k;							// fill feature vector with biases
+   for(c=0;c<2;c++) 													// both colors
+   {
+ 	P=AP[c]; T=12+c+k-2*k*c; while(P)									// parse all pieces of color
+    {
+     s=find_b[(P^P-1)%67]; P&=P-1;										// square and type of piece
+     if((t=T-2*(Gm->Piece[c][s]).type)>10) t=10;						// halfka: wking=bking
+     i=Nn->F_ind[k][s]=ks[k]+64*t+(w+k)*NNSQ[s]+k*s;					// save feature index
+     for(j=0;j<512;j++) 		Nn->F_vec[k][j]+=Weights[512*i+j]; 		// add weight of feature
+     for(j=0;j<8;j++) Nn->F_psq[k][j]+=PSQTweights[8*i+j];				// add psq weight of feature
+    }
+   }
+  }
+ 
+ #endif
+}
+
+void	NNUE_UpdateFeatures(Game* Gm, NNUE* Nn)							// update Feature vector after move
+{
+ int8_t 	from,to,type,cap,ct,k,c,p,ty;
+ int16_t	j,m;
+ int32_t	ks[2],in[2],ind;
+ 
+ if(!Gm->Move_n) return;												// no previous move: no update necessary
+ 
+ m=Gm->Move_n-1; c=1-Gm->color;	p=3;									// previous move (therefore update features AFTER move!)
+ from=(Gm->Moves[m]).from; to=(Gm->Moves[m]).to; if(to==from) return;	// from and to squares of current move. nullmove: no update necessary
+ type=(Gm->Piece[c][to]).type; cap=(Gm->Moves[m]).cap; 					// type of moving and captured piece
+ if(cap)																// move is capture
+  if(to&&(to==(Gm->Moves[m]).ep)&&(type==6)) ct=to+8-16*c; else ct=to;	// ep capture
+  
+ if(type==1) 															// king's move
+ {  
+  if((from-to==2)||(to-from==2)||cap) 									// castles or capture: init both perspectives ...
+   							{NNUE_InitFeatures(Gm,Nn,3);	return;}	// ... and return
+  NNUE_InitFeatures(Gm,Nn,(1<<c)); p-=(1<<c);							// init features of king's perspective only, remove perspective from update
+ }
+ 
+ if(NNUE_V==0x7AF32F20u)												// new HalfKAv2 version
+ {
+  ks[0]=64*11*NNSQ[ (Gm->Officer[0][0]).square];						// white perspective
+  ks[1]=64*11*	 	(Gm->Officer[1][0]).square;							// black perspective (horizontal mirror/flip)
+  ty=12+c-2*type; if(ty>10) ty=10; in[0]=ks[0]+64*ty+NNSQ[to];			// swap clours, flip  board, wking=bking
+  ty=13-c-2*type; if(ty>10) ty=10; in[1]=ks[1]+64*ty+to;
+ }
+
+ #if 		defined(USE_AVX2)											// avx2 version
+  
+  __m256i *w_f,*w_c,*w_t,fv ;
+  int32_t i_f,i_c,i_t;
+  
+  for(k=0;k<2;k++) if(p&(1<<k))											// update both perspectives
+  {
+   w_f=(__m256i*)(Weights+512*(i_f=Nn->F_ind[k][from]));				// pointer to from-feature weights
+   if(cap) w_c=(__m256i*)(Weights+512*(i_c=Nn->F_ind[k][ct])); 			// pointer to cqpture feature weights
+   w_t=(__m256i*)(Weights+512*(i_t=Nn->F_ind[k][to]=in[k]));			// pointer to to-feature-weights
+   
+   for(j=0;j<32;j++)													// parse all features
+   {
+   	fv=_mm256_load_si256((__m256i*)(Nn->F_vec[k])+j);					// load features
+   	fv=_mm256_sub_epi16(fv,*(w_f+j));									// subtract from-feature
+	if(cap) fv=_mm256_sub_epi16(fv,*(w_c+j));							// subtract captured piece feature
+	fv=_mm256_add_epi16(fv,*(w_t+j));									// add to-feature
+	_mm256_store_si256((__m256i*)(Nn->F_vec[k])+j,fv);					// store feature
+   }
+   fv=_mm256_load_si256((__m256i*)(Nn->F_psq[k]));						// load psqt features
+   fv=_mm256_sub_epi32(fv,*(__m256i*)(PSQTweights+8*i_f));				// subtract weight of piece square feature	
+   if(cap) fv=_mm256_sub_epi32(fv,*(__m256i*)(PSQTweights+8*i_c));		// subtract weight of captured piece square feature	
+   fv=_mm256_add_epi32(fv,*(__m256i*)(PSQTweights+8*i_t));				// add weight of piece square feature	
+   _mm256_store_si256((__m256i*)(Nn->F_psq[k]),fv);						// store psqt features
+  }
+ 
+ #elif	defined(USE_NEON) 
+ 
+  int16x8_t	*w_f,*w_c,*w_t,fv;
+  int32x4_t	psq1,psq2;
+  int32_t 	i_f,i_c,i_t;
+  
+  for(k=0;k<2;k++) if(p&(1<<k))											// update both perspectives
+  {
+   w_f=(int16x8_t*)(Weights+512*(i_f=Nn->F_ind[k][from]));				// pointer to from-feature weights
+   if(cap) w_c=(int16x8_t*)(Weights+512*(i_c=Nn->F_ind[k][ct])); 		// pointer to cqpture feature weights
+   w_t=(int16x8_t*)(Weights+512*(i_t=Nn->F_ind[k][to]=in[k]));			// pointer to to-feature-weights
+   
+   for(j=0;j<64;j++)													// parse all features
+   {
+    fv=vld1q_s16(Nn->F_vec[k]+8*j);										// load features
+    fv=vsubq_s16(fv,*(w_f+j));											// subtract from-feature
+	if(cap) fv=vsubq_s16(fv,*(w_c+j));									// subtract captured piece feature
+	fv=vaddq_s16(fv,*(w_t+j));											// add to-feature
+	vst1q_s16(Nn->F_vec[k]+8*j,fv);										// store feature
+   }
+   psq1=vld1q_s32(Nn->F_psq[k]);
+   psq2=vld1q_s32(Nn->F_psq[k]+4);										// load psqt features
+   psq1=vsubq_s32(psq1,*(int32x4_t*)(PSQTweights+8*i_f));
+   psq2=vsubq_s32(psq2,*(int32x4_t*)(PSQTweights+8*i_f+4));				// subtract weight of piece square feature	
+   if(cap) 
+   {
+    psq1=vsubq_s32(psq1,*(int32x4_t*)(PSQTweights+8*i_c));
+    psq2=vsubq_s32(psq2,*(int32x4_t*)(PSQTweights+8*i_c+4));			// subtract weight of captured piece square feature	
+   }
+   psq1=vaddq_s32(psq1,*(int32x4_t*)(PSQTweights+8*i_t));
+   psq2=vaddq_s32(psq2,*(int32x4_t*)(PSQTweights+8*i_t+4));				// add weight of piece square feature	
+   vst1q_s32(Nn->F_psq[k],psq1);
+   vst1q_s32(Nn->F_psq[k]+4,psq2);										// store psqt features
+  }
+   	
+ #else																	// generic version
+ 
+  for(k=0;k<2;k++) if(p&(1<<k))											// p&1: white perspective, p&2: black perspective
+  {
+   ind=512*Nn->F_ind[k][from];											// get feature index of moving piece
+   for(j=0;j<512;j++) Nn->F_vec[k][j]-=Weights[ind+j]; 					// subtract weight of feature
+   ind>>=6; for(j=0;j<8;j++) Nn->F_psq[k][j]-=PSQTweights[ind+j];		// subtract weight of piece square feature
+    
+   if(cap)																// move is capture
+   {
+   	ind=512*Nn->F_ind[k][ct];											// get feature indices of captured piece
+   	for(j=0;j<512;j++) Nn->F_vec[k][j]-=Weights[ind+j];					// subtract weight of feature
+	ind>>=6; for(j=0;j<8;j++) Nn->F_psq[k][j]-=PSQTweights[ind+j];		// subtract weight of piece square feature
+   }
+
+   ind=512*(Nn->F_ind[k][to]=in[k]);									// set feature index of moving piece
+   for(j=0;j<512;j++) Nn->F_vec[k][j]+=Weights[ind+j]; 					// add weight of feature
+   ind>>=6; for(j=0;j<8;j++) Nn->F_psq[k][j]+=PSQTweights[ind+j];		// subtract weight of piece square feature
+  }
+  
+ #endif
+}
+
+short	NNUE_Evaluate(Game* Gm, NNUE* Nn)								// NNUE evaluation function
+{
+ int32_t	o,f,sk;
+ int8_t		our,thr,buc;
+ int		i,j,k,n;
+ 
+ if(Gm->color) {our=1; thr=0;} else {our=0; thr=1;}						// our and their color
+
+ if(NNUE_V==0x7AF32F20u)												// new HalfKA version
+  buc=(Gm->Count[0].officers+Gm->Count[1].officers+						// calculate bucket number from piece count
+       Gm->Count[0].pawns+Gm->Count[1].pawns-1)/4;
+
+ #if 		defined(USE_AVX2)											// avx2 version
+  
+  int32_t 	hid32	[32]	__attribute__((aligned(64))); 				// 32 bit version of hidden layers
+  int8_t	hid8 	[32]	__attribute__((aligned(64)));				//  8 bit version of hidden layers
+  __m256i 	ft1,ft2,fv[32],cl=_mm256_setzero_si256(); 					// feature buffers and dense feature vector
+ 
+  // transform sparse features into a dense feature vector. 16 bit neurons are transformed to clamped 8 bit neurons
+ 
+  for(i=j=0;i<512;i+=32,j++)											// work with vectors of 32 bytes
+  {
+   ft1   	= _mm256_load_si256((__m256i*)((Nn->F_vec[our])+i));		// load first  16 stm feature neurons (16 bit) from memory
+   ft2    	= _mm256_load_si256((__m256i*)((Nn->F_vec[our])+i+16));		// load second 16 stm feature neurons (16 bit) from memory
+   ft1	  	= _mm256_max_epi8(_mm256_packs_epi16(ft1,ft2),cl);			// pack to 32 neurons (8 bit) and clamp from below
+   fv[j]  	= _mm256_permute4x64_epi64(ft1,216);						// save features
+   ft1    	= _mm256_load_si256((__m256i*)((Nn->F_vec[thr])+i));		// load first  16 op feature neurons from memory
+   ft2    	= _mm256_load_si256((__m256i*)((Nn->F_vec[thr])+i+16));		// load second 16 op feature neurons from memory
+   ft1	  	= _mm256_max_epi8(_mm256_packs_epi16(ft1,ft2),cl);			// pack to 32 neurons (8 bit) and clamp from below
+   fv[j+16]	= _mm256_permute4x64_epi64(ft1,216);						// save features		
+  }
+ 
+  // affine transform dense feature vector (1024 x 8 bit) into first hidden layer (16 x 32 bit)
+ 
+  memcpy(hid32,L1biases+16*buc,64); sk=16384*buc;						// load biases (32 bit) of first hidden layer
+ 
+  for(j=16;j<32;j++) hid8[j]=0;											// clear unused upper part of first layer neurons
+  
+  for(j=n=0;j<16;j++,n+=1024) 											// handle one neuron of hidden layer 1 at a time
+  {
+   for(ft2=cl,i=k=0;k<32;i+=32,k++)										// work with vectors of 32 bytes
+   { 
+    ft1 = _mm256_maddubs_epi16(fv[k],*(__m256i*)(L1weights+sk+n+i));	// Multiply activation with H1 weigths (32 x 8 bit)
+    ft2 = _mm256_add_epi32(ft2,_mm256_cvtepi16_epi32(*(__m128i*)(&ft1)));// convert to 32 bit and add up
+    ft1 = _mm256_permute4x64_epi64(ft1,0b01001110);						// swap lower and upper half of vector
+    ft2 = _mm256_add_epi32(ft2,_mm256_cvtepi16_epi32(*(__m128i*)(&ft1)));// convert to 32 bit and add up
+   }
+   ft2=_mm256_hadd_epi32(_mm256_hadd_epi32(ft2,ft2),ft2);				// sum up elements of vector
+   o=(hid32[j]+_mm256_extract_epi32(ft2,0)+_mm256_extract_epi32(ft2,4))>>6;// sum up elements, bias and divide by 64
+   hid8[j] = (int8_t)(o<0?0:(o>127?127:o));								// clamp neurons and convert to 8 bit
+  }
+  
+  cl = _mm256_load_si256((__m256i*)(hid8));								// load activation of first layer neurons
+  
+  // affine transform first hidden layer (16 x 8 bit) to second hidden layer (32 x 32 bit):
+ 
+  memcpy(hid32,L2biases+32*buc,128); sk=1024*buc;						// load biases (32 bit) of second hidden layer
+ 
+  for(j=0;j<32;j++) 													// handle one neuron at a time
+  {
+   ft1 = _mm256_maddubs_epi16(cl,*(__m256i*)(L2weights+sk+32*j));		// Multiply activation with H2 weigths (32 x 8 bit)
+   ft1 = _mm256_cvtepi16_epi32(*(__m128i*)(&ft1));						// convert to 32 bits
+   ft1 = _mm256_hadd_epi32(_mm256_hadd_epi32(ft1,ft1),ft1);				// sum up elements of vector
+   o=(hid32[j]+_mm256_extract_epi32(ft1,0)+_mm256_extract_epi32(ft1,4))>>6;// sum up elements, bias and divide by 64
+   hid8[j] = (int8_t)(o<0?0:(o>127?127:o));								// clamp neurons and convert to 8 bit
+  }
+ 
+  // affine transform second hidden layer activation from 32 x 8 bit to output 1 x 32 bit:
+ 
+  cl = _mm256_load_si256((__m256i*)(hid8));								// load activation of second layer neurons
+  
+  o=L3biases[buc];														// load bias (32 bit) of output neuron
+ 
+  ft1 = _mm256_maddubs_epi16(cl,*(__m256i*)(L3weights+32*buc));			// multiply activation with output weights (32x8 bit)
+  ft2 = _mm256_cvtepi16_epi32(*(__m128i*)(&ft1));						// convert to 32 bits
+  ft1 = _mm256_permute4x64_epi64(ft1,0b01001110);						// swap lower and upper half
+  ft1 = _mm256_cvtepi16_epi32(*(__m128i*)(&ft1));						// convert to 32 bits
+  ft1 = _mm256_add_epi32(ft1,ft2);										// add up
+  ft1 = _mm256_hadd_epi32(_mm256_hadd_epi32(ft1,ft1),ft1);				// sum up elements of vector
+  o  += _mm256_extract_epi32(ft1,0) + _mm256_extract_epi32(ft1,4);		// sum up elements
+ 
+ #elif 		defined(USE_NEON)											// NEON version	
+ 
+  int32_t 	hid32	[32]	__attribute__((aligned(64))); 				// 32 bit version of hidden layers
+  int8_t	hid8 	[32]	__attribute__((aligned(64)));				//  8 bit version of hidden layers
+
+  int16x8_t	ft1,ft2;													// feature buffer
+  int8x16_t	fv[64],y,z=vdupq_n_s8(0);									// dense feature vector
+ 
+ // transform sparse features into a dense feature vector. 16 bit neurons are transformed to clamped 8 bit neurons
+ 
+  for(i=j=0;j<32;i+=16,j++)												// work with vectors of 16 bytes
+  {
+   ft1 		= vld1q_s16((Nn->F_vec[our])+i);							// load first 8 stm feature neurons (16 bit) from memory
+   ft2 		= vld1q_s16((Nn->F_vec[our])+i+8);							// load second 8 stm feature neurons (16 bit) from memory
+   fv[j] 	= vmaxq_s8(vcombine_s8(vqmovn_s16(ft1),vqmovn_s16(ft2)),z); // transform to 8 bit, clamp from below and store in feature vector
+   ft1 		= vld1q_s16((Nn->F_vec[thr])+i);							// load first 8 op feature neurons (16 bit) from memory
+   ft2 		= vld1q_s16((Nn->F_vec[thr])+i+8);							// load second 8 op feature neurons (16 bit) from memory
+   fv[j+32] = vmaxq_s8(vcombine_s8(vqmovn_s16(ft1),vqmovn_s16(ft2)),z); // transform to 8 bit, clamp from below and store in feature vector
+  }
+ 
+ // affine transform dense feature vector (1024 x 8 bit) into first hidden layer (16 x 32 bit)
+ 
+  memcpy(hid32,L1biases+16*buc,64); sk=16384*buc;						// load biases (32 bit) of first hidden layer
+
+  for(j=n=0;j<16;j++,n+=1024) 											// handle one neuron of hidden layer 1 at a time
+  {
+   o = hid32[j];														// get bias of neuron
+   for(i=k=0;k<64;i+=16,k++)											// work with vectors of 16 bytes
+   { 
+    z	= vld1q_s8(L1weights+sk+1024*j+i);								// load weights (16x8 bit) 
+    ft1 = vmull_s8(vget_low_s8(fv[k]),vget_low_s8(z));					// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+    ft1	= vmlal_high_s8(ft1,fv[k],z);									// multiply upper 8 Bytes of features with weights and add to vector
+    o   += vaddvq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)));	// sum up vector elements and add to bias
+   }
+   o>>=6; hid8[j] = (int8_t)(o<0?0:(o>127?127:o));						// divide by 64, clamp neuron and convert to 8 bit
+  }
+   
+ // affine transform first hidden layer (16 x 8 bit) to second hidden layer (32 x 32 bit):
+ 
+  memcpy(hid32,L2biases+32*buc,128); sk=1024*buc; y = vld1q_s8(hid8);	// load biases (32 bit) and neurons of second hidden layer
+ 
+  for(j=0;j<32;j++) 													// handle one neuron at a time
+  {
+   z	= vld1q_s8(L2weights+sk+32*j);									// load first part of weights (16x8 bit) and neurons
+   ft1	= vmull_s8(vget_low_s8(y),vget_low_s8(z));						// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+   ft1	= vmlal_high_s8(ft1,y,z);										// multiply upper 8 Bytes of features with weights and add to vector
+   o    = vaddvq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)));	// sum up vector elements 									
+   o	= (hid32[j]+o)>>6; hid8[j] = (int8_t)(o<0?0:(o>127?127:o));		// add bias, divide by 64, clamp neuron and convert to 8 bit
+  }
+ 
+ // affine transform second hidden layer activation from 32 x 8 bit to output 1 x 32 bit:
+ 
+  z		= vld1q_s8(L3weights+32*buc); y=vld1q_s8(hid8);					// load first part of weights (16x8 bit) and neurons
+  ft1	= vmull_s8(vget_low_s8(y),vget_low_s8(z));						// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+  ft1	= vmlal_high_s8(ft1,y,z);										// multiply upper 8 Bytes of features with weights and add to vector
+  o     = vaddvq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)));	// sum up vector elements 
+  z		= vld1q_s8(L3weights+32*buc+16); y=vld1q_s8(hid8+16);			// load first part of weights (16x8 bit) and neurons
+  ft1	= vmull_s8(vget_low_s8(y),vget_low_s8(z));						// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+  ft1	= vmlal_high_s8(ft1,y,z);										// multiply upper 8 Bytes of features with weights and add to vector
+  o    += vaddvq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)));	// sum up vector elements 									
+  o	   += L3biases[buc]; 												// add bias, divide by 64, clamp neuron and convert to 8 bit
+ 
+ #else																	// generic version
+ 
+  int8_t	in 		[1024]	__attribute__((aligned(64)));
+  int32_t	out 	[32]	__attribute__((aligned(64)));
+
+  for(j=0;j<512;j++) 													// go through feature vector
+  {
+   f=Nn->F_vec[our][j]; in[j]	 =(int8_t)(f<0?0:(f>127?127:f));		// our clamped features
+   f=Nn->F_vec[thr][j]; in[j+512] =(int8_t)(f<0?0:(f>127?127:f));		// concatenate their clamped features
+  }
+ 
+  for(j=0;j<16;j++) out[j]=L1biases[16*buc+j];							// load biases of first hidden layer
+  for(i=0;i<1024;i++) if(in[i]) for(j=0;j<16;j++) 
+   out[j]+=(int32_t)(in[i]*L1weights[16384*buc+1024*j+i]);				// affine transform of first hidden layer
+  for(j=0;j<16;j++) {o=out[j]>>6; in[j]=(int8_t)(o<0?0:(o>127?127:o));}	// clamp output of first hidden layer
+   
+  for(j=0;j<32;j++) out[j]=L2biases[32*buc+j];							// load biases of second hidden layer 
+  for(i=0;i<16;i++) if(in[i]) for(j=0;j<32;j++)
+   out[j]+=in[i]*L2weights[1024*buc+32*j+i];							// affine transform of second hidden layer 
+  for(j=0;j<32;j++) {o=out[j]>>6; in[j]=(int8_t)(o<0?0:(o>127?127:o));}	// clamp output of second hidden layer 
+  
+  o=L3biases[buc];														// load bias of output layer
+ 
+  for(j=0;j<32;j++) o+=(int32_t)(in[j]*L3weights[32*buc+j]); 			// affine transform of third hidden layer
+    
+ #endif
+
+ o+=(Nn->F_psq[our][buc]-Nn->F_psq[thr][buc])/2;						// new HalfKA version: add psqt value
+ 
+ //return short(o/16);
+ return (short)(o/Paras[106].Val);										// scale output
+ //return (short)(o/Paras[106].Val+rand());										// scale output				
+}
+
+void	NNUE_SpeedTest(Game* Gm, NNUE* Nn)
+{
+ int32_t i,j;
+ short   ev;
+ double	 t,tacc,tmax,tmin;
+ 
+ tacc=tmax=0; tmin=1000000;	
+ for(j=0;j<10;j++)
+ {
+  StartTime=1000*clock()/CLOCKS_PER_SEC;		
+  for(i=0;i<1000000;i++)
+  {
+   ev=NNUE_Evaluate(Gm,Nn);
+  }
+  t=(double)(1000*clock()/CLOCKS_PER_SEC-StartTime);
+  tacc+=t; if(t<tmin) tmin=t; if(t>tmax) tmax=t;
+ }
+ printf("Duration: %lf +- %lf ms \n",tacc/10,(tmax-tmin)/2);
+}
+
+
+
+void	PrintVector(void* v, Byte l)
+{
+ int 	i;
+ BitMap n;
+ 
+ for(i=0;i<256/l;i++)
+ {
+  if(l==8) 	n=*((Byte*)(v)+i);
+  if(l==16) n=*((Dbyte*)(v)+i);
+  if(l==32) n=*((Fbyte*)(v)+i);
+  printf("%llu ",n);
+ }
+ printf("\n");
 }
 
 void 	ClearTables()													// clear all hashtables
 {
  BitMap AM;
  
- for(AM=0;AM<32*HEN;AM++) 		hash_t[AM]=0; HASHFILL=0;				// clear transposition table
+ HASHFILL=TTACC=TTHIT1=TTHIT2=TTCUT=TTHLPR=0;							// reset statistics info 
+ for(AM=0;AM<32*HEN;AM++) 		hash_t[AM]=0; 							// clear transposition table
  for(AM=0;AM<   HEN;AM++) 		hash_t[32*AM+1]|=4;						// set first entry bit
  for(AM=0;AM<40*PEN;AM++) 		phash_t[AM]=0;							// clear pawn/king evaluation hashtable	
  for(AM=0;AM< 8*MEN;AM++)		mhash_t[AM]=0;							// clear material hash table
  for(AM=0;AM< 8*EEN;AM++)  		ehash_t[AM]=0;							// clear evaluation hash table
- for(AM=0;AM<   PVN;AM++) 			 Pv[AM]=0; 							// clear pv table
 }
 
 void 	InitNewGame(Game* Gm)											// initialize a new game
 {
- Byte 	i,j,k;
+ Byte 	j,k,l;
+ BitMap AM;
+ int	i;
  
  ClearTables();															// clear all hash tables
- for(i=0;i<64;i++) for(j=0;j<17;j++) for(k=0;k<2;k++) 
+ for(AM=0;AM<   PVN;AM++) 			 Gm->Pv[AM]=0; 						// clear pv table
+ for(i=0;i<64;i++) for(j=0;j<17;j++) for(k=0;k<2;k++) 					// clear counter table
    Gm->Counter[k][j][i]=0;												// initialize counter move table
+ for(i=0;i<6;i++) for(j=0;j<64;j++) for(k=0;k<6;k++) for(l=0;l<64;l++)	// clear counter moves history table
+ 	HISTORY[0][i][j][k][l]=HISTORY[1][i][j][k][l]=1;
+ for(i=0;i<256;i++) 
+  Gm->Killer[i][0][0]=Gm->Killer[i][1][0]=Gm->Killer[i][2][0]=0;		// clear killer list
+ for(i=0;i<250;i++) 													// clear rootmove list
+  {(Gm->Root[i]).Mov=0; (Gm->Root[i]).flags=0; (Gm->Root[i]).Order=1;}	// init moves, flags and order				
+ for(i=0;i<500;i++)														// clear moves list
+ { 
+  (Gm->Moves[i]).from=(Gm->Moves[i]).to=(Gm->Moves[i]).type=
+  (Gm->Moves[i]).cap=(Gm->Moves[i]).castles=(Gm->Moves[i]).ep=
+  (Gm->Moves[i]).fifty=(Gm->Moves[i]).prom=0; 
+  (Gm->Moves[i]).Mov=0;(Gm->Moves[i]).check=false; (Gm->Moves[i]).HASH=0;
+ } 
 }
 
 void 	GetPosition(Game* Gm,char* Mo)									// gets position information from input
@@ -569,10 +1209,84 @@ void 	GetPosition(Game* Gm,char* Mo)									// gets position information from i
   }
  }
  Gm->Move_r=Gm->Move_n;													// set root move number
+ 
  GenMoves(Gm,&Mv);														// generate moves
- Mv.o=0; Mv.s=3; Mv.flg=0x70; i=0;										// init move picker
- while(Gm->Rootmvs[i]=PickMove(Gm,&Mv)) {Gm->TREESIZE[i]=1; i++;}		// fill root move list
- return;		    
+ Mv.o=Mv.flg=i=0; Mv.s=200; 											// init move picker
+ while((Gm->Root[i]).Mov=PickMove(Gm,&Mv)) 
+  {(Gm->Root[i]).Order=1; (Gm->Root[i]).flags=0; i++;}					// fill root move list		    
+}
+
+double	CompareEval(char* csv, short limit, int pos)
+{
+ Game	Gm;
+ Mvs	Mv;
+ NNUE	Nn;
+ double	Diff=0;
+ FILE 	*fpr;
+ char	Line[200],Pos[100];
+ char	*Is;
+ int	Val,Eval,i,n=0;
+ 
+ if(!(fpr=fopen(csv,"r"))) {printf("File does not exist!\n"); return 0;}// open csv file for read
+ printf("Comparing static evaluation for positions in file %s ...\n",csv);
+
+ while((fgets(Line,200,fpr))&&(n<pos))
+ {
+  if(!(Is=strstr(Line,","))) 					continue;				// no comma in line
+  if(strstr(Is+1,"#")) 							continue;				// no mate evaluations
+  if(!sscanf(Is+1,"%d",&Val)) 					continue;				// no evaluation in line
+  if((Val>limit)||(Val<-limit)) 				continue;				// limit exceeded
+  strcpy(Pos,Line); ParseFen(&Gm,Pos); GenMoves(&Gm,&Mv);				// get position and moves 
+  Eval=Evaluation(&Gm,&Nn,&Mv,-MaxScore,MaxScore);						// calculate evaluation
+  if(Gm.color) Eval=-Eval;												// change to black/white format
+  if((Eval>limit)||(Eval<-limit)) 				continue;				// limit exceeded									
+  printf("Val: %d Eval: %d Diff: %f\n",Val,Eval,sqrt((double)(Val-Eval)*(double)(Val-Eval)));
+  n++; Val-=Eval; Diff+=sqrt((double)(Val)*(double)(Val));				// subtract static evaluation
+ }
+ if(!n) printf("No position meets the limit!\n");
+ else printf("Average eval difference of %d positions: %5.0f\n",n,Diff/n);// print average difference
+ 													
+ fclose(fpr);	
+ return Diff/n;	
+}
+
+void	ParseParameters(char* csv, int n)
+{
+ Byte	i,j,k;
+ double	DiffO,DiffP,Diff;
+ 
+ printf("Testing variations of evaluation parameters with data from file %s ...\n",csv);
+ DiffO=DiffP=CompareEval(csv,1000,n); printf("\n");
+ 
+ for(i=0;i<sizeof(Paras)/sizeof(Paras[0]);i++) if(Paras[i].Change)		// parse changeable parameters
+ {
+  if(Paras[i].Val+Paras[i].Change<=Paras[i].High)
+  {
+   printf("Changing parameter %s from %d to %d ...\n",
+   			Paras[i].Name,Paras[i].Val,Paras[i].Val+Paras[i].Change);
+   Paras[i].Val+=Paras[i].Change; ClearTables(); Diff=CompareEval(csv,1000,n); 
+   Paras[i].Val-=Paras[i].Change; if(Diff<DiffP) {DiffP=Diff; j=i; k=1;} 
+   printf("\n");
+  }
+  if(Paras[i].Val-Paras[i].Change>=Paras[i].Low)
+  {
+   printf("Changing parameter %s from %d to %d ...\n",
+   			Paras[i].Name,Paras[i].Val,Paras[i].Val-Paras[i].Change);
+   Paras[i].Val-=Paras[i].Change; ClearTables(); Diff=CompareEval(csv,1000,n);
+   Paras[i].Val+=Paras[i].Change; if(Diff<DiffP) {DiffP=Diff; j=i; k=2;}
+   printf("\n");
+  }
+ }
+ printf("Finished! ");
+ if(DiffP<DiffO)
+ { 
+  if(k==1) printf("Suggesting to change parameter %s from %d to %d ",
+  			Paras[j].Name,Paras[j].Val,Paras[j].Val+Paras[j].Change);
+  else	   printf("Suggesting to change parameter %s from %d to %d!\n",
+  			Paras[j].Name,Paras[j].Val,Paras[j].Val-Paras[j].Change);
+  printf("to achieve %3.0f cp improvement!\n",DiffO-DiffP);
+ }
+ else printf("Suggesting not to change any parameters!\n");
 }
 
 bool 	TestAttk(Game* Gm, Byte k, Byte t, Byte c)						// test if piece type k attacks higher piece  on square t 
@@ -658,7 +1372,7 @@ void 	PrintMoves(Game* Gm)											// prints list of moves
  printf("\n"); 
 } 
 
-void 	PrintPosition(Game* Gm)											// print board
+void 	PrintPosition(Game* Gm, NNUE* Nn)								// print board
 {
  Byte		i,j,k,l;
  Mvs  		Mv;
@@ -687,8 +1401,10 @@ void 	PrintPosition(Game* Gm)											// print board
   printf("piece square opening white: %d black: %d endgame white: %d black: %d\n",
    (Gm->Psv[0]).Open,(Gm->Psv[1]).Open,(Gm->Psv[0]).End,(Gm->Psv[1]).End);// piece square values
   GenMoves(Gm,&Mv);
-  printf("material value: %d overall value: %d\n",						// print evaluation
-  	MatEval(Gm),Evaluation(Gm,&Mv,0,0));							
+  printf("material value: %d overall value: %d ",						// print evaluation
+  	MatEval(Gm),Evaluation(Gm,Nn,&Mv,0,0));
+  if(Options[8].Val) printf("NNUE value: %d",NNUE_Evaluate(Gm,Nn)); 	// print NNUE value
+  printf("\n");							
  }
  for(i=0,BM=1; i<64; i++, BM<<=1)										// print board
  {
@@ -698,6 +1414,7 @@ void 	PrintPosition(Game* Gm)											// print board
    if(!((i+1)&7)) printf("\n");
  }
  printf("\n");
+  
 }
 
 void 	ParseFen(Game *Gm, char *fen)									// scans fen string and sets all variables
@@ -725,7 +1442,7 @@ void 	ParseFen(Game *Gm, char *fen)									// scans fen string and sets all var
  
  i=0; while((sscanf(fen++,"%1s",X)==1)&&(i<64))							// get next character
  {
-  l=(Byte)strcspn("/12345678KQRBNPkqrbnp",X);							// identify character
+  l=(Byte)strcspn("/12345678KQRBNPkqrbnp,",X); 							// identify character
   if(l<9) {i+=l; BS<<=l;} else											// i,S=current square
   {																		// occupied square
    if(l<15) {c=0; l-=8;} else {c=1; l-=14;}								// c=color
@@ -773,22 +1490,21 @@ void 	ParseFen(Game *Gm, char *fen)									// scans fen string and sets all var
 void 	InitDataStructures()											// initializes data structures
 {
  int r;
- 
+
  HEN = (BitMap)(Paras[0].Val*0x100000)/32; 								// number of transposition table entries
  PEN = (BitMap)(Paras[1].Val*0x100000)/40;								// number of pawn table entries
  MEN = (BitMap)(Paras[2].Val*0x100000)/8;								// number of material table entries
  EEN = (BitMap)(Paras[3].Val*0x100000)/8;								// number of evaluation table entries
  DEN = (BitMap)(Paras[0].Val*0x100000)/16; 								// number of perft/divide table entries)
- 
+
  hash_t =(Byte*)(malloc(Paras[0].Val*0x100000+32));						// allocate memory for transposition table
  phash_t=(Byte*)(malloc(Paras[1].Val*0x100000+40));						// allocate memory for pawn hash table
  mhash_t=(Byte*)(malloc(Paras[2].Val*0x100000+8));						// allocate memory for material hash table
  ehash_t=(Byte*)(malloc(Paras[3].Val*0x100000+8));						// allocate memory for evaluation hash table
- 
+
  for(r=0;r<1024;r++) recog[r]=NoRecog;									// initialize recognizer function pointers
  
  // material signature: white Q=001,R=002,B=004,N=008,P=010  black Q=020,R=040,B=080,N=100,P=200
- 
  recog[0x000]=KvK; 														// KvK endgame recognizer function pointer
  recog[0x108]=KNvKN;
  recog[0x084]=KBvKB;
@@ -813,6 +1529,8 @@ void 	InitDataStructures()											// initializes data structures
  recog[0x00F]=KQvK;	  recog[0x1E0]=KvKQ;								// KQRBNvK	and KvKQRBN
  recog[0x00D]=KQvK;	  recog[0x1A0]=KvKQ;								// KQBNvK	and KvKQBN
  
+ recog[0x041]=KQvKR;  recog[0x022]=KRvKQ;
+ 
  recog[0x00C]=KBNvK;  recog[0x180]=KvKBN;
  recog[0x018]=KNPvK;  recog[0x300]=KvKNP;
  recog[0x014]=KBPvK;  recog[0x280]=KvKBP;
@@ -828,7 +1546,6 @@ void 	InitDataStructures()											// initializes data structures
  recog[0x104]=KBvKN;  recog[0x088]=KNvKB;
  // recog[0x202]=KRvKP;  recog[0x050]=KPvKR;
  recog[0x052]=KRPvKR; recog[0x242]=KRvKRP;
-  
 }
 
 short 	NoRecog(Game* Gm, Byte *flags)									// No recognizer available
@@ -841,8 +1558,6 @@ void 	GenMoves(Game *Gm, Mvs *Mv)										// generate moves as bitmaps
 {
  Byte i,c,s,t,cm,cas,ep;
  BitMap B0,B1,B2,B3,BA,BC,BE1,BE2,BK,BM,BN,BP,ATK[8],K;
-
- //stat[11][0]++;														// count calls of move genrator
  
  for(i=0;i<6;i++) 	Mv->OATK[i]=0;										// initialize opponent attacks
  for(i=0;i<8;i++) 	{ATK[i]=0; Mv->Prop[i]=0;}							// hor., vert. and diag. attacks, promotion info
@@ -900,7 +1615,7 @@ void 	GenMoves(Game *Gm, Mvs *Mv)										// generate moves as bitmaps
  if(cm<64) BC=-1;														// all target squares allowed		
  B0=ATK[1]|ATK[2]|ATK[3]; B1=ATK[0]|ATK[2]|ATK[3];						// optimized attack maps
  B2=ATK[0]|ATK[1]|ATK[3]; B3=ATK[0]|ATK[1]|ATK[2];
- Mv->PINS=ATK[0]|B0;													// all pinned pieces stm																		
+ Mv->PINS=(ATK[0]|B0)&Gm->POSITION[c][0];								// all pinned pieces stm																		
  if(cm>127) 															// double check: only king can move
  {
   for(i=1;i<16;i++) Mv->OFFM[i]=0;										// clear all officer moves except king
@@ -1023,9 +1738,9 @@ Dbyte 	PickMove(Game *Gm, Mvs *Mv)										// picks next move from movelist
 {
  // flg: 0:positive/zero SEE, 1: SEE, 2:save square, 
  //		 4: bad captures, 5: quiet moves, 6: check, 7: counter moves
- BitMap BM,KM;
+ BitMap BM,KM,BN,BC,HM, XX;
  Dbyte  Fr,To,Pr,Hm;
- Byte 	i,j,p,q;
+ Byte 	i,j,p,q,k,t;
  
  NMoveO:
  	
@@ -1047,12 +1762,12 @@ Dbyte 	PickMove(Game *Gm, Mvs *Mv)										// picks next move from movelist
   case 1:   (Mv->s)++;
   			if((Gm->Move_n==Gm->Move_r)&&(Hm=Gm->Lastbest)) goto SMove;	// best move of previous iteration, not at ply >0		   
   case 2:   if((Gm->Move_n>Gm->Move_r)) break;							// deliver root moves, not at ply >0
-   			i=0; BM=0; while(Gm->Rootmvs[i])							// parse root moves	 
+   			i=0; BM=0; while((Gm->Root[i]).Mov)							// parse root moves	 
 			{
-  		     if((!(Gm->Rootmvs[i]&64))&&(Gm->TREESIZE[i]>BM))		    // find new move with largest tree 
-			  {BM=Gm->TREESIZE[i]; j=i;} i++;							// backup candidate, next move 
+  		     if((!((Gm->Root[i]).flags&7))&&((Gm->Root[i]).Order>BM))	// find new move with largest tree 
+			  {BM=(Gm->Root[i]).Order; j=i;} i++;						// backup candidate, next move 
 		    }
- 		    if(BM) return Gm->Rootmvs[j]; else return 0;  				// deliver move	or no more root moves		   
+ 		    if(BM) return (Gm->Root[j]).Mov; else return 0;				// deliver move	or no more root moves		   
   case 3:   if(BM=Mv->PAWM[i=2]&PROM8) 			goto PMove;  Mv->s+=1;	// promotion captures left
   case 4:   if(BM=Mv->PAWM[i=0]&PROM8) 			goto PMove;  Mv->s+=1;	// promotion captures right
   case 5:   Mv->s+=1; if(BM=Mv->PAWM[i=1]&PROM8) goto PMove;  			// queen promotions
@@ -1151,24 +1866,50 @@ Dbyte 	PickMove(Game *Gm, Mvs *Mv)										// picks next move from movelist
   		  	 if(!(PAWN_E[Gm->color][1][q]&Gm->POSITION[1-Gm->color][6]))// passed pawn?
 			 										goto PMove;
 		     BM-=KM;
-		    } 							 						break;		    
-  case 35:  Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][5][0]&				// prepare pawn double step to save squares...
+		    } 													break;							 						
+  case 35:  if(BM=Mv->PAWM[i=2])					goto PMove; break;	// unsorted: pawn capture left
+  case 36:  if(BM=Mv->PAWM[i=0])					goto PMove; break;	// unsorted: pawn capture right
+  case 37:	Mv->s+=1; Mv->hist=0;
+			if((!Gm->Move_n)||(Gm->Move_n-Gm->Move_r>Paras[97].Val)||
+			   (!(Gm->Moves[Gm->Move_n-1].Mov))) 				break;	// History moves
+  case 38:  p=(Gm->Moves[Gm->Move_n-1]).type-1; Mv->flg&=~2;			// last move's piece type
+			q=(Gm->Moves[Gm->Move_n-1]).to&63; BN=0; t=6;				// last move's destination
+			HM=Mv->PAWM[3]; 											// all single step pawn moves								
+  			while(HM) 													// parse pawn single steps
+			{
+			 KM=HM&(-HM); HM-=KM; j=find_b[(KM^KM-1)%67];				// get destination
+			 if((BC=HISTORY[Gm->color][p][q][5][j])>BN) 				// find maximum history score
+			   {BN=BC; BM=KM; i=3;} 										// backup move
+			  
+		    }
+			HM=Mv->PAWM[1];												// all double step pawn moves
+  			while(HM) 													// parse pawn double steps
+			{
+			 KM=HM&(-HM); HM-=KM; j=find_b[(KM^KM-1)%67];				// get destination
+			 if((BC=HISTORY[Gm->color][p][q][5][j])>BN)					// find maximum history score 
+			   {BN=BC; BM=KM; i=1;} 									// backup move
+		    }
+  			
+			Mv->o=(Gm->Count[Gm->color]).officers+1;					// officers
+  			while(--(Mv->o))											// parse officers 
+			{
+			 HM=Mv->OFFM[Mv->o-1];										// officer destinations 
+			 k=(Gm->Officer[Gm->color][Mv->o-1]).type;					// officer type
+			 while(HM)													// parse officer moves
+			 {
+			  KM=HM&(-HM); HM-=KM; j=find_b[(KM^KM-1)%67];				// get destination
+			  if((BC=HISTORY[Gm->color][p][q][k-1][j])>BN) 				// find maximum history score	
+			    {BN=BC; Mv->CMB=KM; i=Mv->o; t=k;} 						// backup move
+			 }
+		    }
+			if(!BN)											return(0);	// no more moves left
+			if((BN==1)||(++(Mv->hist)>Paras[96].Val)) 			break;	// no history score
+			if(t==6) {if(i==1) goto PMove; else 	goto DMove;}		// make best pawn move
+			Mv->o=i; 									goto NMoveO;	// make best officer move																			    
+  case 39:  Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][5][0]&				// prepare pawn double step to save squares...
   			 Mv->PAWM[3]&PDS;									break;	// ... with good pst entries	
-  case 36:  if(Mv->CMB) 							goto DMoveS;		// parse all pawn double steps
-  		    Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][5][0]&				// prepare pawn single step to save squares						
-			 Mv->PAWM[1];										break;	
-  case 37:  if(Mv->CMB) 							goto PMoveS;		// parse all pawn move forward
-  		    Mv->o=(Gm->Count[Gm->color]).officers+1; 					// prepare officer moves to save squares
-			Mv->flg&=~1; Mv->flg|=2; Mv->s+=1;
-  case 38:  while(--(Mv->o)) 											// parse officers
-  		    {
-  		   	 i=(Gm->Officer[Gm->color][(Mv->o)-1]).type;				// piece type
-  		   	 Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][i][0]; goto NMoveO;// good pst squares				
-	        }										break;			 
-  case 39:  Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][5][1]&				// prepare pawn double step to save squares...
-  			 Mv->PAWM[3]&PDS;									break;	// ... with average pst entries	
   case 40:  if(Mv->CMB) 							goto DMoveS;		// parse all pawn double steps
-  		    Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][5][1]&				// prepare pawn single step to save squares						
+  		    Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][5][0]&				// prepare pawn single step to save squares						
 			 Mv->PAWM[1];										break;	
   case 41:  if(Mv->CMB) 							goto PMoveS;		// parse all pawn move forward
   		    Mv->o=(Gm->Count[Gm->color]).officers+1; 					// prepare officer moves to save squares
@@ -1176,17 +1917,30 @@ Dbyte 	PickMove(Game *Gm, Mvs *Mv)										// picks next move from movelist
   case 42:  while(--(Mv->o)) 											// parse officers
   		    {
   		   	 i=(Gm->Officer[Gm->color][(Mv->o)-1]).type;				// piece type
+  		   	 Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][i][0]; goto NMoveO;// good pst squares				
+	        }										break;			 
+  case 43:  Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][5][1]&				// prepare pawn double step to save squares...
+  			 Mv->PAWM[3]&PDS;									break;	// ... with average pst entries	
+  case 44:  if(Mv->CMB) 							goto DMoveS;		// parse all pawn double steps
+  		    Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][5][1]&				// prepare pawn single step to save squares						
+			 Mv->PAWM[1];										break;	
+  case 45:  if(Mv->CMB) 							goto PMoveS;		// parse all pawn move forward
+  		    Mv->o=(Gm->Count[Gm->color]).officers+1; 					// prepare officer moves to save squares
+			Mv->flg&=~1; Mv->flg|=2; Mv->s+=1;
+  case 46:  while(--(Mv->o)) 											// parse officers
+  		    {
+  		   	 i=(Gm->Officer[Gm->color][(Mv->o)-1]).type;				// piece type
   		   	 Mv->CMB=PST[Gm->color][Gm->phase<16?1:0][i][1]; goto NMoveO;// average pst squares				
 	        }													break;
-  case 43:  Mv->CMB=Mv->PAWM[3]&PDS;							break;	// prepare pawn double step to save squares
-  case 44:  if(Mv->CMB) goto DMoveS;	Mv->CMB=Mv->PAWM[1];	break;  // double step to save squares
-  case 45:  if(Mv->CMB) goto PMoveS;									// parse all pawn move forward to save squares
+  case 47:  Mv->CMB=Mv->PAWM[3]&PDS;							break;	// prepare pawn double step to save squares
+  case 48:  if(Mv->CMB) goto DMoveS;	Mv->CMB=Mv->PAWM[1];	break;  // double step to save squares
+  case 49:  if(Mv->CMB) goto PMoveS;									// parse all pawn move forward to save squares
   		    Mv->o=(Gm->Count[Gm->color]).officers+1; 
 			Mv->flg&=~1; Mv->flg|=2; Mv->s+=1;							// prepare officer moves to save squares
-  case 46:  while(--(Mv->o)) {Mv->CMB=-1; goto NMoveO;} 		break; 	// officer moves to save squares 
-  case 47:  Mv->o=(Gm->Count[Gm->color]).officers+1; 					// prepare rest of checks
+  case 50:  while(--(Mv->o)) {Mv->CMB=-1; goto NMoveO;} 		break; 	// officer moves to save squares 
+  case 51: Mv->o=(Gm->Count[Gm->color]).officers+1; 					// prepare rest of checks
   			Mv->flg&=~2; Mv->s+=1;										// no SEE	
-  case 48:  while(--(Mv->o)>1)											// king cannot announce check directly
+  case 52: while(--(Mv->o)>1)											// king cannot announce check directly
   		    {
 			 j=(Gm->Officer[Gm->color][Mv->o-1]).type;					// piece type									
   		     if(j==5) Mv->CMB=Mv->OCHK[2];								// knight checks
@@ -1194,11 +1948,10 @@ Dbyte 	PickMove(Game *Gm, Mvs *Mv)										// picks next move from movelist
 		     else {Mv->CMB=Mv->OCHK[0]; if(j==2) Mv->CMB|=Mv->OCHK[1];} // rook or queen
   		     goto NMoveO;
   		    }										Mv->s+=1;
-  case 49:  Mv->s+=1; Mv->o=(Gm->Count[Gm->color]).officers+1; Mv->flg&=~2;// scan captures with negative SEE
-  case 50:  while(--(Mv->o)>1) 											// king cannot move to attacked square
+  case 53: Mv->s+=1; Mv->o=(Gm->Count[Gm->color]).officers+1; Mv->flg&=~2;// scan captures with negative SEE
+  case 54: while(--(Mv->o)>1) 											// king cannot move to attacked square
   			 {Mv->CMB=Gm->POSITION[1-Gm->color][0]; goto NMoveO;} 		// captures with negative SEE
 		    Mv->s=201;											break;	// rest of moves			
-						 		    
   case 100: if(!(Mv->AMVS&Gm->POSITION[1-Gm->color][0]))				// quiescence moves 
   													{Mv->s+=17; break;}	// no captures possible
   		  	if(!Gm->Move_n)							{Mv->s+=3; break;}	// no previous move
@@ -1303,14 +2056,43 @@ Dbyte 	PickMove(Game *Gm, Mvs *Mv)										// picks next move from movelist
 		    Mv->s+=1;	
     
   case 134: if(!(Mv->flg&0x20)) return(0);			Mv->s=201; break;	// no quiet moves
-  		   			
+ 
+  case 199: (Mv->s)++; if(Hm=Mv->Bestmove)			goto SMove;			// hash move		   			
   case 200: if(BM=Mv->PAWM[i=2])					goto PMove; break;	// unsorted: pawn capture left
   case 201: if(BM=Mv->PAWM[i=0])					goto PMove; break;	// unsorted: pawn capture right
   case 202: if(BM=Mv->PAWM[i=3]) 					goto DMove;	break;	// unsorted: pawn double step
   case 203: if(BM=Mv->PAWM[i=1]) 	   				goto PMove; break;	// unsorted: pawn single step
   case 204: Mv->o=(Gm->Count[Gm->color]).officers+1;
    			Mv->s+=1; Mv->flg&=~2; 										// prepare officer moves
-  case 205: if(--(Mv->o)) 			 {Mv->CMB=-1; goto NMoveO;} break;	// officer moves
+  case 205: if(--(Mv->o)) 			 {Mv->CMB=-1; goto NMoveO;} break;	// officer moves		   
+
+  case 220: (Mv->s)++; if(Hm=Mv->Bestmove)			goto SMove;			// hash move			   
+  case 221: if(BM=Mv->PAWM[i=2])					goto PMove; break;	// mate search: pawn capture left
+  case 222: if(BM=Mv->PAWM[i=0])					goto PMove; break;	// mate search: pawn capture right
+  case 223: Mv->s+=1; Mv->o=(Gm->Count[Gm->color]).officers+1; Mv->flg&=~2;	// mate search: prepare officer captures	
+  case 224: while(--(Mv->o)) 											// parse officers
+  			 {Mv->CMB=Gm->POSITION[1-Gm->color][0]; goto NMoveO;} 		// captures 
+		    Mv->s+=1;
+  case 225: Mv->CMB=Mv->PAWM[i=3]&PDS&Mv->OCHK[3];		Mv->s+=1;		// pawn double step checks
+  case 226: if(Mv->CMB) goto DMoveS; 									// parse all pawn double steps checks
+  			Mv->CMB=Mv->PAWM[i=1]&Mv->OCHK[3];			Mv->s+=1;		// pawn single step checks	
+  case 227: if(Mv->CMB) goto PMoveS;									// parse all pawn move forward checks
+  		    Mv->o=(Gm->Count[Gm->color]).officers+1;	Mv->s+=1; 
+  case 228: while(--(Mv->o)>1)											// king cannot announce check directly
+  		    {															
+			 j=(Gm->Officer[Gm->color][Mv->o-1]).type;					// piece type														
+  		     if(j==5) Mv->CMB=Mv->OCHK[2];								// knight checks
+		     else if(j==4) Mv->CMB=Mv->OCHK[1];							// bishop checks
+		     else {Mv->CMB=Mv->OCHK[0]; if(j==2) Mv->CMB|=Mv->OCHK[1];} // rook or queen
+  		     Mv->flg&=~2; 												// no SEE
+			 if(Mv->CMB&=Mv->OFFM[Mv->o-1]) 		goto NMoveO;		// officer checks
+  		    }											Mv->s+=1;
+  case 229: if(BM=Mv->PAWM[i=3]) 					goto DMove;	break;	// unsorted: pawn double step
+  case 230: if(BM=Mv->PAWM[i=1]) 	   				goto PMove; break;	// unsorted: pawn single step
+  case 231: Mv->o=(Gm->Count[Gm->color]).officers+1;
+   			Mv->s+=1; Mv->flg&=~2; 										// prepare officer moves
+  case 232: if(--(Mv->o)) 			 {Mv->CMB=-1; goto NMoveO;} break;	// officer moves
+
   case 250: Mv->s++; if(Hm=Mv->Bestmove)				   goto SMove;	// test move
   default: return(0);  
  }
@@ -1370,6 +2152,7 @@ Dbyte 	PickMove(Game *Gm, Mvs *Mv)										// picks next move from movelist
   goto NMoveP;															// move not possible}
 }
 
+
 Dbyte 	CodeMove(Game* Gm, char *Mo)									// translates move from string
 {
  Mvs	Mv;
@@ -1421,7 +2204,8 @@ void 	Move(Game* Gm, Dbyte Mv)										// makes move
  if(Mv&128) (Gm->Moves[Gm->Move_n]).prom=(Byte)(Mv>>14)+2;				// promoted piece
  else		(Gm->Moves[Gm->Move_n]).prom=0;
  (Gm->Moves[Gm->Move_n]).Mov=Mv;										// compressed move
- p=(Gm->Piece[c][f]).type; o=(Gm->Piece[c][f]).index;					// piece type and index 
+ p=(Gm->Piece[c][f]).type; o=(Gm->Piece[c][f]).index;					// piece type and index
+ (Gm->Moves[Gm->Move_n]).type=p; 
  (Gm->Psv[c]).Open+=Square[c][p-1][0][t]-Square[c][p-1][0][f];			// piece square value opening
  (Gm->Psv[c]).End +=Square[c][p-1][1][t]-Square[c][p-1][1][f];			// piece square value endgame
  (Gm->Move_n)++; fi++; Gm->color=1-Gm->color; HB^=RANDOM_P[12];			// change color, update color hash			
@@ -1686,6 +2470,7 @@ void 	Divide(Game* Gm, Byte d)										// calculates divide
     t++; Move(Gam+j,m); Gam[j].Finished=false; Gam[j].Currm=m;			// prepare thread with move
     pthread_create(&Gam[j].Tid, NULL, PerftCount, (void*)(Gam+j));		// start thread
    }
+  usleep(10000);														// prevent high cpu load of main thread
  } 
  while(t);																// threads still running
  t2=(double)(clock()-t1)/CLOCKS_PER_SEC;								// stop stopwatch
@@ -1726,6 +2511,7 @@ void 	Perft(Game* Gm, Byte d)											// calculates perft
     t++; Move(Gam+j,m); Gam[j].Finished=false; Gam[j].Currm=m;			// prepare thread with move
     pthread_create(&Gam[j].Tid, NULL, PerftCount, (void*)(Gam+j));		// start thread
    }
+  usleep(10000);														// prevent high cpu load of main thread
  } 
  while(t);																// threads still running
  t2=(double)(clock()-t1)/CLOCKS_PER_SEC;								// stop stopwatch
@@ -1769,7 +2555,7 @@ void 	*PerftCount(void *Pe)											// recursive perft
 void 	StoreHashP(Game* Gm, BitMap NOD)								// store perft hash entry
 {
  BitMap KEY,LOCK;
- 
+
  LOCK=(Gm->Moves[Gm->Move_n]).HASH; KEY=(LOCK%DEN)*16;					// calculate hash key (modulo entries)
  *(BitMap*)(hash_t+KEY)=NOD; *(BitMap*)(hash_t+KEY+8)=(LOCK^NOD);		// store nodes and lock with consistency check
  return;			
@@ -1778,10 +2564,11 @@ void 	StoreHashP(Game* Gm, BitMap NOD)								// store perft hash entry
 BitMap 	GetHashP(Game* Gm)												// get perft hash entry
 {
  BitMap KEY,LOCK,NOD,LOCK1;
- 
+
+ TTACC++;																// count tt access
  LOCK=(Gm->Moves[Gm->Move_n]).HASH; KEY=(LOCK%DEN)*16;					// calculate hash key (modulo entries)
  NOD=*(BitMap*)(hash_t+KEY); LOCK1=*(BitMap*)(hash_t+KEY+8); 			// get stored data
- if(LOCK1==(LOCK^NOD)) return NOD;										// consistent entry found
+ if(LOCK1==(LOCK^NOD)) {TTHIT1++; return NOD;}							// consistent entry found, count hits
  return -1;																// no entry found or not consistent
 }
 
@@ -1791,64 +2578,43 @@ BitMap 	GetHash(Game* Gm)												// get hash entry
  Byte* 	key=hash_t+(LOCK%HEN)*32;										// key
  BitMap DATA=*(BitMap*)(key);											// contents
  
- if(!(*(BitMap*)(key+8 )^(DATA&NCRC)^LOCK)) return DATA;				// first slot fits with correct crc
+ TTACC++;																// count tt access
+ if(!(*(BitMap*)(key+8 )^(DATA&NCRC)^LOCK)) {TTHIT1++; return DATA;}	// first slot fits with correct crc
  DATA=*(BitMap*)(key+16);
- if(!(*(BitMap*)(key+24)^(DATA&NCRC)^LOCK)) return DATA;				// second slot fits with correct crc
+ if(!(*(BitMap*)(key+24)^(DATA&NCRC)^LOCK)) {TTHIT2++; return DATA;}	// second slot fits with correct crc
  return 0;																// no fit
 }
 
-
 void	StoreHash(Game* Gm,short Val,Dbyte Move,Byte depth,Byte flags)	// store information in transposition table
 {
- BitMap	LOCK=(Gm->Moves[Gm->Move_n]).HASH;								// lock 
+ BitMap	DATA11,DATA12,DATA21,DATA22,LOCK=(Gm->Moves[Gm->Move_n]).HASH;	// lock 
  Byte* 	key=hash_t+(LOCK%HEN)*32;										// key
- BitMap DATA11=*(BitMap*)(key);											// contents slot 1
- BitMap DATA12=*(BitMap*)(key+8);
- BitMap DATA21=*(BitMap*)(key+16);										// contents slot 2
- BitMap DATA22=*(BitMap*)(key+24);
- 
- if(DATA11&0x0400)	HASHFILL++;											// first entry
- else if((DATA12^(DATA11&NCRC)^LOCK)&&((!(DATA22^(DATA21&NCRC)^LOCK))||	// other position at first slot and same position 
- 		 (DATA21&0x0800)||((Byte)(DATA21&0xFF)<=(Byte)(DATA11&0xFF))))	// at second slot or second slot is old	or has lower 					 
-  {*(BitMap*)(key+16)=DATA11; *(BitMap*)(key+24)=DATA12;}				// draft than 1st copy first slot to second slot
+ Dbyte	Ply=Gm->Move_n-Gm->Move_r;										// current ply
+
+ if(Val<(short)(255-MaxScore)) 		Val-=(short)(Ply);					// adjust negative mate score
+ else if(Val>(short)(MaxScore-255)) Val+=(short)(Ply);					// adjust positive mate score
   
- if(Val<(short)(255-MaxScore)) 		Val-=(short)(Gm->Move_n-Gm->Move_r);// adjust negative mate score
- else if(Val>(short)(MaxScore-255)) Val+=(short)(Gm->Move_n-Gm->Move_r);// adjust positive mate score
-
- DATA11=((BitMap)(Move)<<32)+(((BitMap)(Val)&0xFFFF)<<16)+				// construct entry
- 								((BitMap)(flags)<<8)+(BitMap)(depth);	
+ DATA11=*(BitMap*)(key);												// data contents slot 1
  
- *(BitMap*)(key)=DATA11; *(BitMap*)(key+8)=(DATA11&NCRC)^LOCK;			// save transposition info with crc
-
+ if(DATA11&0x0400) {HASHFILL++; goto StoreHash;}						// first entry
+ 
+ DATA12=*(BitMap*)(key+8);												// CRC of slot 1
+ if(DATA12^(DATA11&NCRC)^LOCK)											// other (or broken) position at first slot
+ {
+  DATA21=*(BitMap*)(key+16); DATA22=*(BitMap*)(key+24);					// contents slot 2	
+  if((DATA21&0x0800)||((Byte)(DATA21&0xFF)<=(Byte)(DATA11&0xFF))||		// slot 2 is old or has lower draft than first ...
+     (!(DATA22^(DATA21&NCRC)^LOCK)))									// ... or slot 2 holds current position
+   {*(BitMap*)(key+16)=DATA11; *(BitMap*)(key+24)=DATA12;}				// move first slot to second slot
+ } else if(((Byte)(DATA11&0xFF)>depth)&&Ply&&(!((DATA11&0x0C00)))) return;// same young position with larger draft at first slot
+ 
+ StoreHash:
+ 	
+ DATA11=((BitMap)(Move)<<32)|(((BitMap)(Val)&0xFFFF)<<16)|				// construct entry
+ 					(((BitMap)(flags)&0xFF)<<8)|(depth&0xFF);	
+ 
+ *(BitMap*)(key)=DATA11; *(BitMap*)(key+8)=(DATA11&NCRC)^LOCK;			// save transposition data and CRC
 }
-/*
 
-void	StoreHash(Game* Gm,short Val,Dbyte Move,Byte depth,Byte flags)	// store information in transposition table
-{
- BitMap	LOCK=(Gm->Moves[Gm->Move_n]).HASH;								// lock 
- Byte* 	key=hash_t+(LOCK%HEN)*32;										// key
- BitMap DATA11=*(BitMap*)(key);											// contents slot 1
- BitMap DATA12=*(BitMap*)(key+8);
- BitMap DATA21=*(BitMap*)(key+16);										// contents slot 2
- BitMap DATA22=*(BitMap*)(key+24);
-    
- if(DATA11&0x0400) HASHFILL++;											// first entry
- else if(!(DATA12^(DATA11&NCRC)^LOCK)) 									// same entry in slot 1
-  {if((Byte)(DATA11&0xFF)>depth) return;} 								// higher depth? -> go back
- else if(!(DATA22^(DATA21&NCRC)^LOCK)) 									// same entry in slot 2
-   {if((Byte)(DATA21&0xFF)>depth) return; else key+=16;} 				// higher depth? -> go back
- else if((DATA21&0x0800)||((Byte)(DATA21&0xFF)<(Byte)(DATA11&0xFF)))	// second entry is old or has lower depth
- 	key+=16;					 
- 
- if(Val<(short)(255-MaxScore)) 		Val-=(short)(Gm->Move_n-Gm->Move_r);// adjust negative mate score
- else if(Val>(short)(MaxScore-255)) Val+=(short)(Gm->Move_n-Gm->Move_r);// adjust positive mate score
-
- DATA11=((BitMap)(Move)<<32)+(((BitMap)(Val)&0xFFFF)<<16)+				// construct entry
- 								((BitMap)(flags)<<8)+(BitMap)(depth);	
- 
- *(BitMap*)(key)=DATA11; *(BitMap*)(key+8)=(DATA11&NCRC)^LOCK;			// save transposition info with crc
-}
-*/
 bool 	DrawTest(Game* Gm)												// position is a draw?
 {
  Dbyte	Mm,Mn=Gm->Move_n;												// move number
@@ -1927,7 +2693,8 @@ bool 	SEE(Game *Gm, Dbyte Mov, short Thr)								// SEE of move larger or equal 
 
  if(Mov&128) return true;												// promotion
  t=(Byte)(Mov>>8)&63; f=(Byte)(Mov)&63;									// origin and destination
- if(p=(Gm->Piece[1-Gm->color][t]).type) Val=Paras[3+p].Val; 			// possible SEE gain is value of piece on destination
+ if(p=(Gm->Piece[1-Gm->color][t]).type) 								// possible SEE gain is value of piece on destination
+ 	Val=(Paras[3+p].Val+Paras[99+p].Val)/2; 			
  else Val=0;
  if(Val<Thr) return false;												// value of piece to gain is lower than threshold
  BM=(A8<<f); BO[0]=(Gm->ROTATED[0]&ATC[0][t])&(~(BM|(A8<<t)));			// potential attackers of destination square
@@ -1940,7 +2707,7 @@ bool 	SEE(Game *Gm, Dbyte Mov, short Thr)								// SEE of move larger or equal 
  pm=(Gm->Piece[Gm->color][f]).type;										// moving piece type
  while(BO[0])															// parse potential attackers
  {
-  if(Val-Paras[3+pm].Val>=Thr) return true;								// even if piece is lost, move is worthwhile
+  if(Val-((Paras[3+pm].Val+Paras[99+pm].Val)/2)>=Thr) return true;		// even if piece is lost, move is worthwhile
   a=0; pn=7; while((!a)&&(--pn))										// parse potential attackers 
   if(OM=(Gm->POSITION[1-Gm->color][pn]&ATC[pn][t]&BO[0])) switch(pn)	// potential attacker exists
   {
@@ -1960,8 +2727,8 @@ bool 	SEE(Game *Gm, Dbyte Mov, short Thr)								// SEE of move larger or equal 
    default: BM=OM; a=1;													// king or knight is real attacker
   }
   if(!a) return (Val>=Thr);												// no more attackers: value is definite
-  Val-=Paras[3+pm].Val; 												// subtract attacked piece value, 
-  if(Val+Paras[3+pn].Val<Thr) return false;								// even if attacker is captured value is below threshold
+  Val-=(Paras[3+pm].Val+Paras[99+pm].Val)/2; 							// subtract attacked piece value, 
+  if(Val+(Paras[3+pn].Val+Paras[99+pn].Val)/2<Thr) return false;		// even if attacker is captured value is below threshold
   BM&=-BM; BO[0]&=~BM; f=find_b[(BM^BM-1)%67];							// pick one attacker and remove, square of attacker
   for(p=1;p<4;p++)
   {
@@ -1987,7 +2754,7 @@ bool 	SEE(Game *Gm, Dbyte Mov, short Thr)								// SEE of move larger or equal 
   }
     
   if(!a) return (Val>=Thr);												// no more defenders: value is definite
-  Val+=Paras[3+pn].Val;													// add defenders piece value
+  Val+=(Paras[3+pn].Val+Paras[99+pn].Val)/2;							// add defenders piece value
   BM&=-BM; BO[0]&=~BM; f=find_b[(BM^BM-1)%67];							// pick one defender and remove, square of defender
   for(p=1;p<4;p++)
    {s=shift[p+3][f]; BO[p]&=~(s<128?BM<<s:BM>>(256-s));}				// remove defender from rotated bitmaps
@@ -1998,47 +2765,49 @@ bool 	SEE(Game *Gm, Dbyte Mov, short Thr)								// SEE of move larger or equal 
 short 	MatEval(Game* Gm)												// material+pst+stm evaluation
 {
  BitMap	LOCK,PM,QM;
- short	Pa,Pw,Pb,Val,j;
+ short	Pa,Pw,Pb,Val,j,p,v[5];
  Byte	i;
 
+ p=min(Gm->phase,24);													// game phase
+ 
  LOCK=*(BitMap*)(mhash_t+((Gm->MHASH)%MEN)*8); Val=(short)(LOCK);		// material hash entry
  if((short)((LOCK^Gm->MHASH)>>16)!=Val)									// entry does not fit or crc wrong
  {
+  for(i=0;i<5;i++) v[i]=(p*Paras[5+i].Val+(24-p)*Paras[101+i].Val)/48;	// calculate material values dependent on game phase
   Pw= Pb=0;																// initialize piece value
-  for(i=1;i<(Gm->Count[0]).officers;i++) 
-   Pw+=Paras[3+(Gm->Officer[0][i]).type].Val; 							// accumulate piece values white
-  for(i=1;i<(Gm->Count[1]).officers;i++) 
-   Pb+=Paras[3+(Gm->Officer[1][i]).type].Val; 							// accumulate piece values black	
+  for(i=1;i<(Gm->Count[0]).officers;i++) 								// accumulate piece values white
+   Pw+=v[(Gm->Officer[0][i]).type-2];  							
+  for(i=1;i<(Gm->Count[1]).officers;i++) 								// accumulate piece values black
+   Pb+=v[(Gm->Officer[1][i]).type-2]; 								
 
-  Val=Pw-Pb+(short)((Gm->Count[0]).pawns-(Gm->Count[1]).pawns)*			// add pawn values
-  												Paras[9].Val;
+  Val=Pw-Pb+(short)((Gm->Count[0]).pawns-(Gm->Count[1]).pawns)*v[4];	// add pawn values
 
   PM=Gm->POSITION[0][4]; if((PM&WS)&&(PM&BS)) Val+=Paras[10].Val; 		// pair of bishops bonus white 	
   QM=Gm->POSITION[1][4]; if((QM&WS)&&(QM&BS)) Val-=Paras[10].Val; 		// pair of bishops bonus black
   if((!(PM&(PM-1)))&&(!(QM&(QM-1)))&&((PM|QM)&WS)&&((PM|QM)&BS)) i=1; 	// single differently colored bishops
   else i=0;	
   
-  Pa=Paras[9].Val*((short)((Gm->Count[0]).pawns)-5);					// value of number of pawns above 5 for white	
+  Pa=v[4]*((short)((Gm->Count[0]).pawns)-5); if(Pa<0) Pa=0;				// value of number of pawns above 5 for white	
   PM=Gm->POSITION[0][5]; while(PM) {Val+=Pa/16; PM&=PM-1;}				// bonus for knights with pawns on the board 								
   PM=Gm->POSITION[0][3]; while(PM) {Val-=Pa/8;  PM&=PM-1;}				// malus for rooks with pawns on the board					
-  Pa=Paras[9].Val*((short)((Gm->Count[1]).pawns)-5);					// value of number of pawns above 5 for white	
+  Pa=v[4]*((short)((Gm->Count[1]).pawns)-5); if(Pa<0) Pa=0;				// value of number of pawns above 5 for white	
   PM=Gm->POSITION[1][5]; while(PM) {Val-=Pa/16; PM&=PM-1;}				// bonus for knights with pawns on the board 								
   PM=Gm->POSITION[1][3]; while(PM) {Val+=Pa/8;  PM&=PM-1;}				// malus for rooks with pawns on the board
 
   j=64;
-  
+ 
   if(Val>0)																// white is leading
   {
-   if((!((Gm->Count[0]).pawns))&&(Pw-Pb<=Paras[7].Val))					// white has no pawns and is less than a bishop ahead
-    j=(Pw<Paras[6].Val) ? 0 : ((Pb<=Paras[7].Val) ? 4 : 14);			// scale factor for reduced material
+   if((!((Gm->Count[0]).pawns))&&(Pw-Pb<=v[2]))							// white has no pawns and is less than a bishop ahead
+    j=(Pw<v[1]) ? 0 : ((Pb<=v[2]) ? 4 : 14);							// scale factor for reduced material
    else if(i&&((Gm->Count[0]).officers==2)&&
    				((Gm->Count[1]).officers==2)) j=22;						// opposing bishops
    else j=min(64,36+(i?2:7)*(Gm->Count[0]).pawns);						// scale factor for reduced material
   }
   else if(Val<0)														// black is ahead
   {
-   if((!((Gm->Count[1]).pawns))&&(Pb-Pw<=Paras[7].Val))					// black has no pawns and is less than a bishop ahead
-    j=(Pb<Paras[6].Val) ? 0 : ((Pw<=Paras[7].Val) ? 4 : 14);			// scale factor for reduced material
+   if((!((Gm->Count[1]).pawns))&&(Pb-Pw<=v[2]))							// black has no pawns and is less than a bishop ahead
+    j=(Pb<v[1]) ? 0 : ((Pw<=v[2]) ? 4 : 14);							// scale factor for reduced material
    else if(i&&((Gm->Count[0]).officers==2)&&
    				((Gm->Count[1]).officers==2)) j=22;						// opposing bishops
    else j=min(64,36+(i?2:7)*(Gm->Count[1]).pawns);						// scale factor for reduced material
@@ -2049,36 +2818,85 @@ short 	MatEval(Game* Gm)												// material+pst+stm evaluation
   *(BitMap*)(mhash_t+((Gm->MHASH)%MEN)*8)=LOCK;							// save entry
  }
 
- j=min(Gm->phase,24);													// game phase
- 
- Val+=(((((Gm->Psv[0]).Open-(Gm->Psv[1]).Open)*j+						// tempered piece square value for opening...
- 	  ((Gm->Psv[0]).End-(Gm->Psv[1]).End)*(24-j))/48)*					// ... and endgame;
+ Val+=(((((Gm->Psv[0]).Open-(Gm->Psv[1]).Open)*p+						// tempered piece square value for opening...
+ 	  ((Gm->Psv[0]).End-(Gm->Psv[1]).End)*(24-p))/48)*					// ... and endgame;
 	   Paras[11].Val)/10;												 
 	   	   	   	  
  if(Gm->color) Val=-Val;												// stm is black 
   	  
- return Paras[12].Val+Val;												// stm bonus
+ //return Paras[12].Val+Val;												// stm bonus
+ return Val;
 }
 
-short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
+void	DebugEval(Game* Gm)
+{
+ Mvs	Mv;
+ NNUE	Nn;
+ Byte	i;
+ short	v0,v1,v2,v3,v4,v5;
+ Byte	*ekey,*pkey,*mkey;
+  
+ ekey=ehash_t+(((Gm->Moves[Gm->Move_n]).HASH)%EEN)*8;					// evaluation hash table entry address
+ mkey=mhash_t+((Gm->MHASH)%MEN)*8;										// material hash table entry address
+ pkey=phash_t+((Gm->PHASH)%PEN)*40; 									// pawn hash table entry address 
+ 
+ GenMoves(Gm,&Mv); if(Options[8].Val) NNUE_InitFeatures(Gm,&Nn,3);	    // generate moves and initialize NNUE (needed for eval)
+ v0=Evaluation(Gm,&Nn,&Mv,-MaxScore,MaxScore); v1=MatEval(Gm); v5=0;	// evaluation with standard parameters
+ if(Gm->color) {v0=-v0; v1=-v1;}
+ printf("info string Debug evaluation: %d \n",v0);
+ printf("info string ------\n");
+ 	 
+ for(i=0;i<sizeof(Paras)/sizeof(Paras[0]);i++) if(Paras[i].Change)		// parse changeable parameters
+ { 
+  if(i==13) 
+  {
+   printf("info string ------\n");
+   printf("info string Material, PST and side to move bonus: %d\n",v1);	
+   printf("info string ------\n");
+  }
+  v4=Paras[i].Val; 														// standard parameter
+  *(BitMap*)(ekey)=*(BitMap*)(pkey)=*(BitMap*)(mkey)=0; 				// reset hash tables
+  Paras[i].Val=Paras[i].Low;											// set parameter to lower limit
+  v2=Evaluation(Gm,&Nn,&Mv,-MaxScore,MaxScore);							// get evaluation with this parameter
+  *(BitMap*)(ekey)=*(BitMap*)(pkey)=*(BitMap*)(mkey)=0; 				// reset hash tables
+  Paras[i].Val=Paras[i].High;											// set parameter to upper limit
+  v3=Evaluation(Gm,&Nn,&Mv,-MaxScore,MaxScore); 						// get evaluation with this parameter
+  *(BitMap*)(ekey)=*(BitMap*)(pkey)=*(BitMap*)(mkey)=0;					// reset hash tables
+  Paras[i].Val=v4;														// set parameter to original value
+  if(Gm->color) {v2=-v2; v3=-v3;}
+  if((v2!=v0)||(v3!=v0))
+  {
+   if(i>12) v5+=v0-v2;
+   printf("info string %21s (current: %4d): %5d possible (max: %4d): %4d \n",// show name and influence of parameter ...
+    Paras[i].Name,v4,v0-v2,Paras[i].High,v3-v0);						// ... on evaluation
+  }
+ }
+ printf("info string ------\n");
+ printf("info string Sum of positional factors: %d\n",v5);
+}
+
+short	Evaluation(Game* Gm, NNUE* Nn,  Mvs* Mv, short Alpha, short Beta)// evaluation
 {
  BitMap ELOCK,EHASH,PLOCK[5],PP[2],AP[2],PAI,PAB,PAD,PAP,PAC,PAW,PCH,PPH,CM;
  BitMap	KM,PS,NM,MM,MP[5],PM,PN,PO;
- short	Val,Oval,Eval,Dval,cl;
- Byte	pk[2],gp,flg,co,sp,p;
+ short	Val,Oval,Eval,Dval,cl,p;
+ Byte	pk[2],gp,flg,co,sp;
  Byte	*ekey,*pkey;
  
  //return MatEval(Gm);
 
  EHASH=(Gm->Moves[Gm->Move_n]).HASH; ekey=ehash_t+(EHASH%EEN)*8;		// evaluation hash table entry address
  ELOCK=*(BitMap*)(ekey); Val=(short)(ELOCK);							// evaluation is in the first two bytes
- if(((ELOCK^EHASH)>>16)==(BitMap)(Val)&0xFFFF)		return Val;			// evaluation found in hash table
+ if(((ELOCK^EHASH)>>16)==(BitMap)(Val)&0xFFFF) goto EVAL_END;			// evaluation found in hash table
+ 
+ if(Options[8].Val) {Val=NNUE_Evaluate(Gm,Nn); goto STORE_EVAL;}		// return NNUE evaluation
  
  gp=min(24,Gm->phase);													// game phase 0 (endgame) to 24 (opening)
- Val=MatEval(Gm);														// material evaluation
- PP[0]=Gm->POSITION[0][6]; PP[1]=Gm->POSITION[1][6];					// pawn positions
- pk[0]=(Gm->Officer[0][0]).square; pk[1]=(Gm->Officer[1][0]).square;	// pawn positions
+ Val=MatEval(Gm); 														// material evaluation
  
+ PP[0]=Gm->POSITION[0][6]; PP[1]=Gm->POSITION[1][6];					// pawn positions
+ pk[0]=(Gm->Officer[0][0]).square; pk[1]=(Gm->Officer[1][0]).square;	// king positions
+
  pkey=phash_t+(Gm->PHASH%PEN)*40; 										// pawn hash key and weak pawns
  PLOCK[0]=*(BitMap*)(pkey); 	  PLOCK[1]=*(BitMap*)(pkey+8); 			// lock 0..3
  PLOCK[2]=*(BitMap*)(pkey+16); 	  PLOCK[3]=*(BitMap*)(pkey+24); 		// 
@@ -2126,7 +2944,7 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
   {
    PS=PP[co]; cl=1-2*co; while(PS)										// positions of pawns
    {
-    sp=find_b[(PS^PS-1)%67];											// square of pawn
+    sp=find_b[(PS^PS-1)%67]-8*cl;										// square in front of pawn
     Eval+=Paras[13].Val*cl*Dist[pk[1-co]][sp];							// distance of opponent king 
     Eval-=Paras[13].Val*cl*Dist[pk[co]][sp];							// distance of friendly king
     PS&=PS-1;															// next pawn
@@ -2151,10 +2969,11 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
    while(PS)															// parse passed pawns
    {
     sp=find_b[(PS^PS-1)%67];											// square of pawn
-    Eval+=Paras[24].Val*cl*(2*Dist[pk[1-co]][sp]-Dist[pk[co]][sp]);		// distance to kings
+    Eval+=Paras[24].Val*cl*(2*Dist[pk[1-co]][sp+16*co-8]-
+										Dist[pk[co]][sp+16*co-8]);		// distance to kings
     if(co) Dval=(sp>>3); else Dval=7-(sp>>3); Dval*=Dval; 				// rank of passed pawn
 	Oval+=Paras[25].Val*Dval*cl; Eval+=Paras[26].Val*Dval*cl;			// general opening and endgame bonus			
-    if(PAWN_E[co][4][sp]&CM) Eval+=(Dval*cl)/Paras[27].Val;				// connected passed pawn
+    if(PAWN_E[co][4][sp]&CM) Eval+=Paras[27].Val*Dval*cl/8;				// connected passed pawn
 	PS&=PS-1;															// next pawn
    }
 
@@ -2162,9 +2981,10 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
    while(PS)
    {
     sp=find_b[(PS^PS-1)%67];											// square of pawn
-    Eval+=Paras[28].Val*cl*(2*Dist[pk[1-co]][sp]-Dist[pk[co]][sp]);		// distance to kings
+    Eval+=Paras[28].Val*cl*(2*Dist[pk[1-co]][sp+16*co-8]-
+										Dist[pk[co]][sp+16*co-8]);		// distance to kings
     if(co) Dval=(sp>>3); else Dval=7-(sp>>3); Dval*=Dval;				// rank of candidate pawn
-	Oval+=Paras[29].Val*Dval*cl; Eval+=Paras[30].Val*Dval*cl;	  		// endgame bonus
+	Oval+=Paras[29].Val*Dval*cl; Eval+=Paras[30].Val*Dval*cl;	  		// opening and endgame bonus
     PS&=PS-1;															// next pawn
    }
   }
@@ -2176,6 +2996,8 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
   
   Oval-=Paras[31].Val*(3-Popcount(STEP[8][pk[0]]&PP[0]));				// pawn shield white
   Oval+=Paras[31].Val*(3-Popcount(STEP[9][pk[1]]&PP[1]));				// pawn shield black
+  Oval+=Paras[55].Val*(Popcount(AP[0]&STEP[1][pk[1]])-					// white pawns attacking black king 1 area
+ 					   Popcount(AP[1]&STEP[1][pk[0]]));					// black pawns attacking white king 1 area
    
   if(((pk[0]&7)==(pk[1]&7))&&((pk[0]-pk[1]==16)||(pk[1]-pk[0]==16)))	// vertical opposition
   	  															flg|=1;	
@@ -2197,7 +3019,7 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
   Oval=(short)(PLOCK[1]>>48); Eval=(short)(PLOCK[2]&0xFFFF); 			// evaluations and flags
   flg=(Byte)(PLOCK[3]); PAP=PLOCK[3]&0x00FFFFFFFFFFFF00;				// flags and passed pawns
   AP[0]=PLOCK[1]&0x0000FFFFFFFFFFFF; AP[1]=PLOCK[2]&0xFFFFFFFFFFFF0000;	// pawn attacks
-  PAW=PLOCK[4]&0x00FFFFFFFFFFFF00;
+  PAW=PLOCK[4]&0x00FFFFFFFFFFFF00;										// weak pawns
  }
 
  // rest of pawn evaluation depending on other pieces
@@ -2216,8 +3038,8 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
   {
    sp=find_b[(PS^PS-1)%67];	PM=A8<<(sp+16*co-8);						// square and stop square of pawn
    if(co) Dval=(sp>>3); else Dval=7-(sp>>3);							// rank of passed pawn
-   if(PAWN_E[co][0][sp]&Gm->ROTATED[0])									// piece in front
-    {Eval-=Paras[32].Val*cl; if(PM&Gm->ROTATED[0]) Eval-=Paras[33].Val*cl;}	// malus for stop/telestop 
+   if(PAWN_E[co][0][sp]&Gm->POSITION[1-co][0])							// opponent piece in front
+    {Eval-=Paras[32].Val*cl; if(PM&Gm->POSITION[1-co][0]) Eval-=Paras[33].Val*cl;}	// malus for stop/telestop 
    else if(!(PAWN_E[co][2][sp+p]&Gm->POSITION[1-co][1]))				// opponent king not in Berger's square
    	if((Gm->Count[1-co]).officers<2)	Eval+=Dval*Paras[34].Val*cl;	// race bonus
 	else if(((Gm->Count[1-co]).officers<3)&&(!(PAWN_E[co][0][sp]&KM))) 		
@@ -2239,7 +3061,7 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
  if(Gm->color) Val-=Dval; else Val+=Dval;								// evaluation 
 
  if(Paras[40].Val&&((Val+Paras[40].Val<Alpha)||							// lazy eval
- 	(Val-Paras[40].Val>Beta))) goto EVAL_END;
+ 	(Val-Paras[40].Val>Beta))) goto STORE_EVAL;
  
  // Mobility and attacks
  
@@ -2250,13 +3072,16 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
     	(PP[1-Gm->color]&(~AP[1-Gm->color]));							// and undefended pawns
 
  NM=(~PP[0])&(~PP[1]); PS=Mv->PINO&NM; PO=Mv->PINS&NM;					// opponent's and stm's pinned officers
- Val+=Paras[41].Val*(Popcount(PS)-Popcount(PO));						// malus for pinned officers  
+ Val+=Paras[41].Val*(Popcount(PS)-Popcount(PO));						// malus for pinned officers 
 
  NM&=Mv->DCHK; 															// discovered check officers
  PS=NM&Gm->POSITION[Gm->color][0]; PO=NM&Gm->POSITION[1-Gm->color][0];
  Val+=Paras[42].Val*(Popcount(PS)-Popcount(PO));						// bonus for discovered check officers
  
- for(co=1;co<5;co++)													// walk thru moves by piece (no kings or pawns)
+ Val+=Paras[99].Val*(Popcount(PN&(Mv->ADES)&(~Mv->OATK[0])&(~AP[1-Gm->color]))-	// hanging oponent's pieces
+ 		  			 Popcount(PM&(Mv->OATK[0])&(~Mv->ADES)));			// hanging own pieces
+ 
+ if(!((Mv->cp)&192)) for(co=1;co<5;co++)								// walk thru moves by piece (no kings or pawns, no check)
  {	
   PPH=MP[co]; PCH=Mv->OATK[co+1]&CM;									// moves by stm and opponent officers 
   Val+=Paras[43].Val*(Popcount(PPH&PN)-Popcount(PCH&PM));				// bonus for officers attacking pieces
@@ -2334,14 +3159,8 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
  Val+=Paras[54].Val*(Popcount((~Mv->OATK[0])&CNTR)-						// malus for uncontrolled center squares
  		 	Popcount((~Mv->ADES)&CNTR));
 
-				 
- // King safety evaluation
- 
- Val+=Paras[55].Val*(Popcount(AP[Gm->color]&KM)-						// Pawns attacking king 1 area
- 			Popcount(AP[1-Gm->color]&MM));
- 
  Oval=Eval=0;															// reinit opening and endgame evaluation
- 
+
  // King evaluation
  	
  // Queen evaluation
@@ -2398,7 +3217,7 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
    sp=find_b[(PS^PS-1)%67];												// bishop 
    if((!(PAWN_E[co][6][sp]&PP[1-co]))&&(AP[co]&(A8<<sp)))				// bishop defended and not attackable by pawns
    {
-	Eval+=cl*Paras[66].Val;												// bonus for defence by pawn
+	Oval+=cl*Paras[66].Val;												// bonus for defence by pawn
     if(co) 	{if(sp>31) Oval-=Paras[67].Val;} 							// bonus for outpost
 	else 	{if(sp<32) Oval+=Paras[67].Val;}	
    }
@@ -2410,12 +3229,12 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
  
  for(co=0; co<2; co++)
  {
-  PS=Gm->POSITION[co][5]; while(PS)										// positions of knights
+  PS=Gm->POSITION[co][5]; cl=1-2*co; while(PS)							// positions of knights
   {
    sp=find_b[(PS^PS-1)%67];												// square of knight
    if((!(PAWN_E[co][6][sp]&PP[1-co]))&&(AP[co]&(A8<<sp)))				// knight defended and not attackable by pawns
    {
-   	Eval+=cl*Paras[68].Val;												// bonus for defence by pawn
+   	Oval+=cl*Paras[68].Val;												// bonus for defence by pawn
     if(co) 	{if(sp>31) Oval-=Paras[69].Val;} 							// bonus for outpost
     else 	{if(sp<32) Oval+=Paras[69].Val;}
    }
@@ -2457,14 +3276,17 @@ short	Evaluation(Game* Gm, Mvs* Mv, short Alpha, short Beta)			// evaluation
  	
  if(Gm->color) Val-=Dval; else Val+=Dval;								// evaluation 
 
- EVAL_END:
+ STORE_EVAL:
  *(BitMap*)(ekey)=EHASH^(((BitMap)(Val)&0xFFFF)<<16); *(short*)(ekey)=Val;// store evaluation in hash table
- return Val;
+
+ EVAL_END:
+ return (Paras[12].Val+Val)*(100-(Gm->Moves[Gm->Move_n]).fifty)/100;	// stm bonus and 50-move reduction
 }
 
-short	Qsearch(Game* Gm, short Alpha, short Beta, Byte depth)			// quiescence search
+short	Qsearch(Game* Gm, NNUE* Nnue, short Alpha, short Beta, Byte depth)// quiescence search
 {
  Mvs	Mv;
+ NNUE	Nn;
  Dbyte	Mov,Ply=Gm->Move_n-Gm->Move_r;									// current ply
  short 	Dv,Apriori,Posv,Expect,Bestval,Val;
  Byte	inr,i;
@@ -2472,8 +3294,10 @@ short	Qsearch(Game* Gm, short Alpha, short Beta, Byte depth)			// quiescence sea
  //return MatEval(Gm);
 
  if(Ply&1) Dv=5-((short)(Ply)>5?5:(short)(Ply)); else Dv=0;				// additional draw value to accelerate clear draw
- if(Ply>Maxply) Maxply=Ply;												// update maximal ply
- if((Tmax&&((Fbyte)(clock()-StartTime)>Tmax))&&(!Ponder)) Stop=true;	// time exceeds hard break 
+ if(Ply>Gm->Maxply) Gm->Maxply=Ply;										// update maximal ply
+
+ if((Tmax&&((Fbyte)(1000*clock()/CLOCKS_PER_SEC-StartTime)>Tmax))&&     // time exceeds hard break 
+                                            (!Ponder)) Stop=true;	
  						
  if((Beta<=Alpha)||(Stop)) 					return Alpha;				// no search window or stop recognized
  if(DrawTest(Gm)) 							return Paras[74].Val-Dv;	// 3 or 50 draw
@@ -2497,6 +3321,9 @@ short	Qsearch(Game* Gm, short Alpha, short Beta, Byte depth)			// quiescence sea
   if((Mv.cp==64)||(Mv.cp==128)||(Mv.cp==192)) 
   								return Gm->Move_n-Gm->Move_r-MaxScore;	// mate
   else if(!(Mv.cp))							return Paras[74].Val-Dv;	// stalemate
+  
+  if(Options[8].Val) {Nn=*Nnue; NNUE_UpdateFeatures(Gm,&Nn);}			// update NNUE feature vector
+ 
   Bestval=-MaxScore; Mv.flg=0x20;										// init best value and scan all moves
  }
  else
@@ -2505,13 +3332,17 @@ short	Qsearch(Game* Gm, short Alpha, short Beta, Byte depth)			// quiescence sea
   if(Gm->POSITION[Gm->color][6]&(P7<<(40*Gm->color))) 					// stm might promote
   		Expect=Paras[95].Val;											// expected promotion value
   else Expect=0;
-  if(Apriori+Expect+Paras[5].Val+Posv<=Alpha) return Apriori; 			// even potential queen capture is not enough
+  if(Apriori+Expect+(Paras[5].Val+Paras[101].Val)/2+Posv<=Alpha) 
+  											return Apriori; 			// even potential queen capture is not enough
   for(i=2;i<7;i++) if(Gm->POSITION[1-Gm->color][i])						// search for maximal possible material gain
-  		{Expect+=Paras[3+i].Val; break;}								// most valuable piece
+   {Expect+=(Paras[3+i].Val+Paras[99+i].Val)/2; break;}					// most valuable piece
   if(Apriori+Expect+Posv<=Alpha) 			return Apriori; 			// even best possible gain is not enough
   GenMoves(Gm,&Mv);														// generate moves
   if(!(Mv.cp))								return Paras[74].Val-Dv;	// stalemate
-  if(!(inr&64))	Apriori=Evaluation(Gm,&Mv,Alpha,Beta);					// if no recognizer get position value, now we know POSV!
+  
+  if(Options[8].Val) {Nn=*Nnue; NNUE_UpdateFeatures(Gm,&Nn);}			// update NNUE feature vector
+  
+  if(!(inr&64))	Apriori=Evaluation(Gm,&Nn,&Mv,Alpha,Beta);				// if no recognizer get position value, now we know POSV!
   if(Apriori>=Beta)							return Apriori;				// stand pat
   if(Apriori+Expect<=Alpha) 				return Apriori;				// even maximum mat. gain is insufficient
   if(Apriori>Alpha) Alpha=Apriori;										// lower bound
@@ -2525,13 +3356,15 @@ short	Qsearch(Game* Gm, short Alpha, short Beta, Byte depth)			// quiescence sea
   if(!(Mv.flg&0x30))													// no check->delta pruning
   {
    if(Mov&128) Expect=Paras[95].Val; else Expect=0;						// expected promotion value
-   if(i=(Gm->Piece[1-Gm->color][(Mov>>8)&63]).type) 
-   												Expect=Paras[3+i].Val;	// best expectation
+   if(i=(Gm->Piece[1-Gm->color][(Mov>>8)&63]).type)
+   			Expect=(Paras[3+i].Val+Paras[99+i].Val)/2; 					// best expectation	
    if((Apriori+Expect+Posv<=Alpha)&&(!TestMCheck(Gm,&Mv,Mov))) continue;// delta pruning if no check
   }
   Move(Gm,Mov); ALLNODES++; 											// make move
+
   if((level==4)&&(ALLNODES>=MAXNODES)) Stop=true;						// max. nodes in level 4 reached
-  Val=-Qsearch(Gm,-Beta,-Alpha,depth+1);								// negamax search, depth increases!
+ 
+  Val=-Qsearch(Gm,&Nn,-Beta,-Alpha,depth+1);							// negamax search, depth increases!
   UnMove(Gm);															// take back move											
   if(Val>Bestval) {Bestval=Val; if(Val>=Beta) return Val;}				// new bestval, fail high cutoff
   if(Val>Alpha) Alpha=Val;					
@@ -2552,14 +3385,15 @@ void 	GetPV(Game* Gm)													// retrieve principal variation
  {
   GenMoves(Gm,&Mv);														// generate moves
   PM=(Gm->Moves[Gm->Move_n]).HASH; PM^=(PM>>32); PM^=(PM>>16);			// fold hash signature to 16 bit
-  Mv.Bestmove=Pv[(Dbyte)(PM)]&0xFFBF; Mv.o=Mv.flg=0; Mv.s=250;			// test move from PV table
+  Mv.Bestmove=Gm->Pv[(Dbyte)(PM)]&0xFFBF; Mv.o=Mv.flg=0; Mv.s=250;		// test move from PV table
   if(!PickMove(Gm,&Mv)) 												// move is not valid. try to get pv move ...
   {
-   Mv.Bestmove=0;
+   Mv.Bestmove=0; 
    if(HM=GetHash(Gm)) 													// ... from hashtable
    {
     Mv.Bestmove=(Dbyte)(HM>>32)&0xFFBF; Mv.o=Mv.flg=0; Mv.s=250;		// test move from hashtable	
-	if(PickMove(Gm,&Mv)) Pv[(Dbyte)(PM)]=Mv.Bestmove; else Mv.Bestmove=0;// move is valid: save move in pv table										  
+	if(PickMove(Gm,&Mv)) Gm->Pv[(Dbyte)(PM)]=Mv.Bestmove; 				// move is valid: save move in pv table
+	else Mv.Bestmove=0;										  
    }													
   }
   if(Mv.Bestmove&&((!n)||(!DrawTest(Gm))))								// move valid -> update position
@@ -2574,20 +3408,22 @@ void 	GetPV(Game* Gm)													// retrieve principal variation
 
 void 	PrintPV(Game* Gm, short Val, short Alpha, short Beta)			// print PV
 {
+ Byte	i;
  char	Sm[10];
  short	Mm=Gm->Move_r;
  double T2=(double)(clock()-StartTime)/CLOCKS_PER_SEC; 					// overall time passed
  Dbyte	Hf=(HASHFILL*1000)/HEN;											// hash table fill state
 
- if(Gm->Threadn) return;												// helpers cannot print
-
  if((Gm->Move_n-Gm->Move_r)&1) {Val=-Val; Alpha=-Alpha; Beta=-Beta;}	// pv in mid of tree
  GetPV(Gm);																// retrieve PV
 
+ if((midepth>1)&&((Fbyte)(clock()-StartTime)<CLOCKS_PER_SEC/10)&&		// no time to print during the first 1/10 s
+ 												(level!=5)) return;		// except for mate search
+ 
  if(Options[0].Val) 													// uci mode													
  {
-  printf("info depth %d seldepth %d ",Gm->idepth,Maxply);				// depth info
-  printf("time %.0lf nodes %llu ",(double)(1000*T2),ALLNODES); 			// time and nodes
+  printf("info depth %d seldepth %d ",Gm->idepth,Gm->Maxply);			// depth info
+  printf("time %d nodes %llu ",(int)(1000*T2),ALLNODES); 				// time and nodes
   printf("nps %.0lf ",(double)(ALLNODES)/T2);							// nodes per second
   printf("hashfull %d score ",Hf>1000?1000:Hf);							// hashtable fill status
   if(Val>MaxScore-255) 		printf("mate %d ",(MaxScore-Val+1)/2);		// mate in n
@@ -2600,12 +3436,12 @@ void 	PrintPV(Game* Gm, short Val, short Alpha, short Beta)			// print PV
    printf("cp %d ",Val);
   }
   if(Val<=Alpha) 		printf("upperbound ");							// fail low
-  else if(Val>=Beta) 	printf("lowerbound ");							// fail high	
-  printf("pv ");														// prepare print of pv
+  else if(Val>=Beta) 	printf("lowerbound ");							// fail high
+  if(Gm->mpv) printf("multipv %d ",Gm->mpv); else printf("pv ");		// prepare print of pv															
  }
  else																	// terminal mode
  {
-  printf("Depth: %d/%d ",Gm->idepth,Maxply);							// depth		
+  printf("Depth: %d/%d ",Gm->idepth,Gm->Maxply);						// depth		
   if(Val>MaxScore-255)	printf("value=M%d",(int)((MaxScore-Val+1)/2));	// mate in n
   else if(Val<255-MaxScore)	printf("value=-M%d",(int)((Val+MaxScore)/2));// -mate in n
   else printf("value=%d",Val);											// print ordinary value
@@ -2615,17 +3451,44 @@ void 	PrintPV(Game* Gm, short Val, short Alpha, short Beta)			// print PV
  while((Gm->Moves[Mm]).Mov) 											// no Nullmoves
   {UncodeMove((Gm->Moves[Mm]).Mov,Sm); printf("%-7s",Sm); Mm++;}		// get move from list
  printf("\n"); fflush(stdout);
+ 
+ if(Options[9].Val) PrintStats();										// print search statistics
+
+}
+
+void	PrintStats()													// print search statistics
+{
+ Byte	i;
+ 
+ Stat[0].Val=(double)(100*(TTHIT1+TTHIT2)) 	/(double)(TTACC);			// tt hits
+ Stat[1].Val=(double)(100*TTHIT2) 			/(double)(TTHIT1+TTHIT2);	// tthits second slot
+ Stat[2].Val=(double)(100*TTCUT)  			/(double)(TTHIT1+TTHIT2);	// tt cuts
+ Stat[3].Val=(double)(100*TTHLPR) 			/(double)(TTHIT1+TTHIT2);	// tt helper
+ 
+ printf("info string Stats: ");											// print statistics
+ for(i=0;i<sizeof(Stat)/sizeof(Stat[0]);i++)
+  {printf("| %s: %.2lf %s ",Stat[i].Name,Stat[i].Val,Stat[i].Unit);}		// print value and units
+ printf("\n"); fflush(stdout);
 }
 
 void 	PrintCurrent(Game* Gm, Dbyte Cm, Dbyte Nn)						// prints current move
 {
  char 	Sm[10];
-
+ int	Hf=(HASHFILL*1000)/HEN;											// hash table fill state
+ double T2=(double)(clock()-StartTime)/CLOCKS_PER_SEC; 					// overall time passed
+ 
+ if(level!=5) if((Fbyte)(clock()-StartTime)<CLOCKS_PER_SEC/10) return;	// no time to print during the first 1/10 s
  if(Gm->Threadn) return;												// helpers cannot print
  UncodeMove(Cm,Sm);														// uncode move
  
  if(Options[0].Val)														// UCI mode
-  printf("info depth %d currmove %s currmovenumber %d\n",Gm->idepth,Sm,Nn);// print current move
+ {
+  printf("info depth %d seldepth %d ",Gm->idepth,Gm->Maxply);			// depth info
+  printf("time %.0lf nodes %llu ",(double)(1000*T2),ALLNODES); 			// time and nodes
+  printf("nps %.0lf ",(double)(ALLNODES)/T2);							// nodes per second
+  printf("hashfull %d ",Hf>1000?1000:Hf);								// hashtable fill status
+  printf("currmove %s currmovenumber %d \n",Sm,Nn);						// print current move
+ }
  else printf("current: %-7s\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b",Sm);		// print and move to start of line			
  fflush(stdout);														// flush stdout									
 }
@@ -2643,28 +3506,30 @@ bool	TestLine(Game* Gm, Byte d)										// test sequence of moves
  return true;	  													
 }
 
-short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // recursive negamax search	
+short	Search(Game* Gm, NNUE* Nnue, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // recursive negamax search	
 {																	 
  Mvs	Mv,MvB;
- Dbyte	Mov,Bm;
- short 	Val,Hval,Mcval,Bestval,Oalpha,Dv,Ply;
+ NNUE	Nn;
+ Dbyte	Mov,Bm,MovX;
+ short 	Val,Mcval,Bestval,Oalpha,Dv,Ply, Hval;
  Byte	r,rm,inr,ext,hd,f,flg,m,n,cm,to,from,cap,type,lmr,hdepth;
  BitMap	HM,PM,NM,KS,RM,NC;
- 
- char	Mm[10];
 
+
+ if(depth>254) return Alpha;											// limit depth to max depth
  Oalpha=Alpha; Ply=(short)(Gm->Move_n-Gm->Move_r); Bestval=-MaxScore-10;// initialize values
  hdepth=depth; *Bestm=0; flg=0; inr=128; (Gm->Moves[Gm->Move_n]).Mov=0;	// search flags: 0:multi cut, 1:deep search condition,
  																		// 2:mate threat, 3:nullmove not required, 4:mate value, 
 																		// 5:one move only 6:in check, 7: we have an evaluation from TT,IID or IN
 
  if(Ply&1) Dv=5-(Ply>5?5:Ply); else Dv=0;								// additional draw value to accelerate clear draw
- if(Ply>Maxply) Maxply=Ply;	if(depth>maxdepth) maxdepth=depth;			// update maximal ply
- if((Tmax&&((Fbyte)(clock()-StartTime)>Tmax))&&(!Ponder)) 				// time exceeds hard break 
- 	Stop=true;					
- if((Beta<=Alpha)||(Stop)) 					return Alpha;				// no search window or stop recognized
- if(depth&&DrawTest(Gm)) if(Ply) 			return Paras[74].Val-Dv;	// draw according to 3 or 50 moves
+ if(Ply>Gm->Maxply) Gm->Maxply=Ply;										// update maximal ply
  
+ if((Tmax&&(!Ponder)&&Ply&&
+  ((Fbyte)(1000*clock()/CLOCKS_PER_SEC-StartTime)>Tmax))) Stop=true;	// time exceeds hard break 
+ 					
+ if((Beta<=Alpha)||(Stop)) 					return Alpha;				// no search window or stop recognized
+ if(depth&&DrawTest(Gm)) if(Ply) 			return Paras[74].Val-Dv;	// draw according to 3-fold or 50 moves
  if(((Gm->Moves[Gm->Move_n-1]).fifty)&&(Gm->Move_n>2))					// previous move was reversible
   if((Gm->Moves[Gm->Move_n-1]).from==(Gm->Moves[Gm->Move_n-3]).to)		// same piece moves again
   	(Gm->perm)++; else Gm->perm=0;										// sequence broken
@@ -2672,43 +3537,50 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
  
  if(depth>6) r=(Byte)(Paras[82].Val); 									// adaptive nullmove reduction
  else r=(Byte)(Paras[82].Val?Paras[82].Val-1:0);	
- PM=(Gm->Moves[Gm->Move_n]).HASH; PM^=(PM>>32); PM^=(PM>>16);			// fold hash signature to 16 bit
-
- if(HM=GetHash(Gm))														// TT entry found
+ PM=(Gm->Moves[Gm->Move_n]).HASH; PM^=(PM>>32); PM^=(PM>>16);			// fold hash signature to 16 bit 
+ 
+ if((HM=GetHash(Gm))&&(Ply||(Gm->mpv<2)))								// TT entry found
  {
-  hd=(Byte)(HM); f=(Byte)(HM>>8); Val=Hval=(short)(HM>>16);				// get depth, flags, value and move 
+  hd=(Byte)(HM); f=(Byte)(HM>>8); Val=(short)(HM>>16);					// get depth, flags, value and move 
   *Bestm=(Dbyte)((HM>>32)&0xFFBF); 							flg|=128;	// we have a TT value and move
-  if(Val>MaxScore-255)		{Val-=Ply; 						flg|=16;}	// adjust mate score
-  else if(Val<255-MaxScore) {Val+=Ply; 						flg|=16;}
+  if(f&16) TTHLPR++;													// count entries from helpers
+  if(Val>(short)(MaxScore-255))		 									// positive mate score
+   {Val-=Ply; flg|=16; if((!(f&1))&&(Val>=Beta)) {TTCUT++; return Val;}}// adjust value	
+  else if(Val<(short)(255-MaxScore)) 
+   {Val+=Ply; flg|=16; if((!(f&2))&&(Val<=Alpha)) {TTCUT++; return Val;}}// adjust value
+  (Gm->Moves[Gm->Move_n]).Val=Val;
   if(*Bestm)
   {
-   if((!(f&1))&&(Val>=Beta)) flg|=1;
+   if((!(f&1))&&(Val>=Beta)) 								flg|=1;
    if((!Gm->Move2Make)&&(!Ply)) Gm->Move2Make=*Bestm;					// new root move
+
    if((hd>1)&&(!Ply)&&(Gm->idepth==1)) 
-   					{Gm->idepth=maxdepth=Maxply=hd; return Val;}		// skip unnecessary iterations
+   	 				{Gm->idepth=Gm->Maxply=hd>254?254:hd; return Val;}	// skip unnecessary iterations
   }
   if(depth<=hd)															// hashdepth sufficient
-   if(f&1) 		{if(Val<=Alpha) return Val; if(Val<Beta)  Beta=Val;}	// upper bound
-   else if(f&2) {if(Val>=Beta)  return Val; if(Val>Alpha) Alpha=Val;}	// lower bound
-   else							return Val;								// exact value
-  if(Beta<=Alpha)				return Alpha;							// hash cutoff
-  if((depth<=hd+1+r)&&(!(f&2))&&(Val<Beta)) 				flg|=8;		// nullmove will not cut off -> nullsearch not necessary
+   if(f&1) 		{if(Val<=Alpha) {TTCUT++; return Val;} if(Val<Beta)  Beta=Val;}	// upper bound
+   else if(f&2) {if(Val>=Beta)  {TTCUT++; return Val;} if(Val>Alpha) Alpha=Val;}// lower bound
+   else							{TTCUT++; return Val;}					// exact value
+  if(Beta<=Alpha)				{TTCUT++; return Alpha;}				// hash cutoff
+  if((depth-r-1<=hd)&&(!(f&2))&&(Val<Beta)) 				flg|=8;		// nullmove will not cut off -> nullsearch not necessary -1
  } 
- 
+
  if(MaxScore-Ply<Beta) 													// mate distance pruning: stm has a mate
   {Beta=MaxScore-Ply;  if(Alpha>=Beta) return Beta;}					// already shorter mate found
  if(Alpha<Ply-MaxScore)													// opponent has a mate
   {Alpha=Ply-MaxScore; if(Beta<=Alpha) return Alpha;}					// opponent has already found a shorter mate
-
- if(!depth) {Bestval=Qsearch(Gm,Alpha,Beta,0); goto Hash;}				// quiescence search
+ 
+ if(!depth) {Bestval=Qsearch(Gm,Nnue,Alpha,Beta,0); goto Hash;}			// quiescence search
+ 
+ if(Options[8].Val) {Nn=*Nnue; if(Ply) NNUE_UpdateFeatures(Gm,&Nn);}	// copy NNUE data update with last move
  
  if((!(*Bestm))&&Paras[84].Val&&(depth>(Byte)(Paras[84].Val)))			// get best move from Internal iterative deepening
  {
-  Search(Gm,Alpha,Beta,depth-(Byte)(Paras[84].Val),Bestm);				// search with reduced depth
+  Search(Gm,&Nn,Alpha,Beta,depth-(Byte)(Paras[84].Val),Bestm);			// search with reduced depth
   *Bestm&=0xFFBF;
  }
  
- if(!(*Bestm)) *Bestm=Pv[(Dbyte)(PM)]&0xFFBF;							// try to get best move from PV hash table
+ if(!(*Bestm)) *Bestm=(Gm->Pv[(Dbyte)(PM)])&0xFFBF;						// try to get best move from PV hash table
 
  Mv.Bestmove=*Bestm;
  
@@ -2728,16 +3600,15 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
  {
   Val=(recog[Gm->Matsig])(Gm,&inr);										// interior node recognition
   if((inr&128)&&((Val>MaxScore-255)||(Val<255-MaxScore))) 	flg|=16;	// mate value
-  if(!inr) {*Bestm=0; StoreHash(Gm,Val,0,hdepth,0); return Val;}		// exact score
-  //{Bestval=Val; *Bestm=0; goto Hash;}							
+  if(!inr) {StoreHash(Gm,Val,0,hdepth,0); return Val;}					// exact score						
   else if(inr&1)														// upper bound
   {
-   if(Val<=Alpha) 			{Bestval=Val; *Bestm=0; goto Hash;}			// fail low
+   if(Val<=Alpha) 					{Bestval=Val; goto Hash;}			// fail low
    if(Val<Beta)  	Beta=Val; 											// shrink window
   }
   else if(inr&2)														// lower bound
   {
-   if(Val>=Beta) 			{Bestval=Val; *Bestm=0; goto Hash;}			// fail high
+   if(Val>=Beta) 					{Bestval=Val; goto Hash;}			// fail high
    if(Val>Alpha) 	Alpha=Val;											// shrink window
    if(Val>Bestval) 	Bestval=Val;										// new best value
   }
@@ -2756,14 +3627,14 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
     &&((Gm->Moves[Gm->Move_n-1]).Mov||(Gm->Moves[Gm->Move_n-2]).Mov))	// ... and 2 pieces, no check, allow silent moves after check	
  {																		// double null allowed but not 3 in a row
   Move(Gm,0);															// make nullmove
-  if(depth<r+2) 	 Val=-Qsearch(Gm,-Beta,1-Beta,0);					// quiescence search at depth<r+2
-  else				 Val=- Search(Gm,-Beta,1-Beta,depth-r-1,&Bm);		// nullsearch with reduction r
+  if(depth<r+2) 	 Val=-Qsearch(Gm,&Nn,-Beta,1-Beta,0);				// quiescence search at depth<r+2
+  else				 Val=- Search(Gm,&Nn,-Beta,1-Beta,depth-r-1,&Bm);	// nullsearch with reduction r
   UnMove(Gm);															// take back nullmove
   if((Val<255-MaxScore)) 									flg|=4;		// mate threat
   if((Val<=Alpha-Paras[85].Val)&&(depth==2))							// deep search condition? nullmove fails low and ...
   {
-   if(!(flg&128)) {Hval=Evaluation(Gm,&Mv,Alpha,Beta); 	flg|=128;}		// ... evaluation ...
-   if(Hval>=Beta)											flg|=2;		// ... fails high
+   if(!(flg&128)) {(Gm->Moves[Gm->Move_n]).Val=MatEval(Gm); flg|=128;}	// ... evaluation ...
+   if((Gm->Moves[Gm->Move_n]).Val>=Beta)					flg|=2;		// ... fails high
   }
   if((Val>=Beta)&&(Val<=MaxScore-255)) 									// nullmove cutoff
    if(depth>r) depth-=r; else 						return Val;			// verified nullmove							 
@@ -2779,8 +3650,8 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
   {
    cm++;																// count move
    Move(Gm,Mov); ALLNODES++;											// make move
-   if(depth<(Byte)(Paras[83].Val)+2) Val=-Qsearch(Gm,-Beta,1-Beta,0);	// quiescence search
-   else	Val=-Search(Gm,-Beta,1-Beta,depth-(Byte)(Paras[83].Val)-1,&Bm);	// test beta cutoff with reduced depth
+   if(depth<(Byte)(Paras[83].Val)+2) Val=-Qsearch(Gm,&Nn,-Beta,1-Beta,0);	// quiescence search
+   else	Val=-Search(Gm,&Nn,-Beta,1-Beta,depth-(Byte)(Paras[83].Val)-1,&Bm);	// test beta cutoff with reduced depth
    UnMove(Gm);															// take back move
    if(Val>Mcval) Mcval=Val;												// best value so far
    if(Val>=Beta) if(++m>=(Byte)(Paras[87].Val)) 	return Mcval;		// multi cutoff
@@ -2788,16 +3659,23 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
   }																		// no multicut
  }
 
- if(!(flg&128)) 			Hval=Evaluation(Gm,&Mv,Alpha,Beta);			// get evaluation if not already done
- Mv.o=Mv.s=n=cm=0; if(depth>4) Mv.flg=0xF0; else Mv.flg=0x70;			// counter moves only for d>4
- 
- if(!Ply) while(Gm->Rootmvs[n]) Gm->Rootmvs[n++]&=0xFFBF;				// clear rootmove processed flags if no helper
+ if(!(flg&128)) (Gm->Moves[Gm->Move_n]).Val=MatEval(Gm); 				// get estimated evaluation if not already done
+ 	
+ Mv.o=Mv.s=cm=0; if(depth>4) Mv.flg=0xF0; else Mv.flg=0x70;				// counter moves only for d>4
+ 													
+ if(!Ply) 
+  {n=0; while((Gm->Root[n]).Mov) {(Gm->Root[n]).flags&=0xFE; n++;}}		// clear rootmove processed flags
 
  while(Mov=PickMove(Gm,&Mv))											// loop through moves
- {
-  if(!Ply) {rm=0; while(Mov!=Gm->Rootmvs[rm]) rm++; Gm->Rootmvs[rm]|=64;}// flag root move processed
+ {  
   if(Stop) 											return Bestval;		// stop detected
-  
+  if(!Ply) 
+  {
+   rm=0; while(Mov!=(Gm->Root[rm]).Mov) rm++; 							// find root move
+   if((Gm->Root[rm]).flags&7) continue;									// move must be excluded
+   (Gm->Root[rm]).flags|=1;												// flag move as processed
+  }											
+   
   to  =(Byte)((Mov>>8)&63); from=(Byte)(Mov&63); 						// origin and destination of move
   type=(Gm->Piece[Gm->color][from]).type;								// moving piece
   cap =(Gm->Piece[1-Gm->color][to]).type;								// captured piece
@@ -2818,57 +3696,81 @@ short	Search(Game* Gm, short Alpha, short Beta, Byte depth, Dbyte* Bestm) // rec
   if((Alpha>255-MaxScore)&&(Alpha<MaxScore-255)&&cm&&KS&&				// not first move king not in danger
     (Beta>255-MaxScore)&&(Beta<MaxScore-255)&&(depth<5)&&(!ext))		// no mate values not giving check no extension
   {
-   Mcval=Alpha-Hval; Val=Hval;											// Alpha - node value
-   if(cap)		Mcval-=Paras[cap+3].Val;								// subtract material gain
-   if(Mov&128)	Mcval-=Paras[(Mov>>14)+5].Val-Paras[9].Val;				// subtract material gain of promotion
+   Val=(Gm->Moves[Gm->Move_n]).Val; Mcval=Alpha-Val;					// Alpha - node value
+   if(cap)		Mcval-=(Paras[cap+3].Val+Paras[cap+99].Val)/2;			// subtract material gain
+   if(Mov&128)	Mcval-=(Paras[(Mov>>14)+5].Val+Paras[(Mov>>14)+101].Val-// subtract material gain of promotion
+   						Paras[9].Val-Paras[105].Val)/2;				
    if(Mcval>Paras[74+depth].Val) 							goto AEL;	// futility pruning
   }
   NC=Gm->NODES;															// backup nodecount
   Move(Gm,Mov);	ALLNODES++;	(Gm->NODES)++;								// make move
-  
-  if((level==4)&&(ALLNODES>=MAXNODES)) Stop=true;						// nodes exceed limit
-  if((!Ply)&&(Gm->idepth>0)) PrintCurrent(Gm,Mov,cm+1);					// print current move at root
+  if((level==4)&&(ALLNODES>=MAXNODES)&&(!Gm->Threadn)) Stop=true;		// nodes exceed limit
+  if((!Ply)&&(Gm->idepth>8)) PrintCurrent(Gm,Mov,cm+1);					// print current move at root
   if(!cm)																// pv node / first node
   {
-   if(depth+ext<=1) Val=-Qsearch(Gm,-Beta,-Alpha,0);					// quiescence search
-   else				Val= -Search(Gm,-Beta,-Alpha,depth+ext-1,&Bm);		// pvs: pv node: normal search
+   if(depth+ext<=1) Val=-Qsearch(Gm,&Nn,-Beta,-Alpha,0);				// quiescence search
+   else				Val= -Search(Gm,&Nn,-Beta,-Alpha,depth+ext-1,&Bm);	// pvs: pv node: normal search
   }
   else
   {
    if((flg&64)||(Mov&64)||(Mv.s<35)||(!Ply)||(!(Paras[88].Val))||		// in check or giving check, PV, tactical, root, no LMR,...
     ((Gm->Count[1-Gm->color]).pawns+(Gm->Count[1-Gm->color]).officers<3)// stm has only one piece/pawn left
 	||((Gm->Count[0]).officers<2)||((Gm->Count[1]).officers<2)||		// one side has no pieces left
-	(Mv.PINS&(A8<<from))||TestAttk(Gm,type,to,Gm->color)) lmr=0;		// moving a pinned piece or higher piece is attacked-> no lmr
+	(Mv.PINS&(A8<<from))||TestAttk(Gm,type,to,Gm->color))				// moving a pinned piece or higher piece is attacked-> no lmr
+	lmr=0;		
    else 
    {
-    lmr=depth/(Byte)(Paras[88].Val); 									// lmr based on depth, move lector state and deep search
-	if((Mv.s>50)&&(!(flg&2))) lmr+=(Byte)(Paras[94].Val);
+    lmr=depth/(Byte)(Paras[88].Val); 									// lmr based on depth, move selector state and deep search
+	if((Mv.s>54)&&(!(flg&2))) lmr+=(Byte)(Paras[94].Val);
    }	 
 
-   if(depth+ext<=1+lmr) Val=-Qsearch(Gm,-Alpha-1,-Alpha,0);				// null window quiescence search
-   else			Val=-Search(Gm,-Alpha-1,-Alpha,depth+ext-1-lmr,&Bm);	// null window search			  										
+   if(depth+ext<=1+lmr) Val=-Qsearch(Gm,&Nn,-Alpha-1,-Alpha,0);			// null window quiescence search
+   else			Val=-Search(Gm,&Nn,-Alpha-1,-Alpha,depth+ext-1-lmr,&Bm);// null window search			  										
    if((Val>Alpha)&&(Val<Beta))											// research
-    if(depth+ext<=1) Val=-Qsearch(Gm,-Beta,-Alpha,0);					// quiescence research with open window and no lmr
-    else			 Val= -Search(Gm,-Beta,-Alpha,depth+ext-1,&Bm);		// normal research with open window and no lmr
+    if(depth+ext<=1) Val=-Qsearch(Gm,&Nn,-Beta,-Alpha,0);				// quiescence research with open window and no lmr
+    else			 Val= -Search(Gm,&Nn,-Beta,-Alpha,depth+ext-1,&Bm);	// normal research with open window and no lmr
   }
+  
   UnMove(Gm);															// take back move
  
 AEL:																	// jump here for AEL pruning
+  
   if(!Ply)																// root but no IID 
-   {Gm->TREESIZE[rm]=Gm->NODES-NC; if(Val>50-MaxScore) (Gm->noloose)++;}// save treesize of root move and count nonloosing moves
+  {
+   if(Paras[98].Val<2) (Gm->Root[rm]).Order=Gm->NODES-NC; 				// save treesize of root move...
+   if(Val>50-MaxScore) (Gm->noloose)++;				 					// ... and count nonloosing moves
+  }
+  
   cm++;
+  
   if(Stop)											return Bestval;		// stop command recognized
+  /*
+  if((HM=GetHash(Gm))&&((Byte)(HM)>hdepth)&&(!Ply))
+  {
+   f=(Byte)(HM>>8); Hval=(short)(HM>>16);
+   if(f&1) 		{if(Hval<=Alpha) return Hval; if(Hval<Beta)  Beta=Hval;}// upper bound
+   else if(f&2) {if(Hval>=Beta)  return Hval; if(Hval>Alpha) Alpha=Hval;}// lower bound
+   else							 return Hval;							// exact value
+   if(Beta<=Alpha)				 return Alpha;							// hash cutoff
+  }
+  */
   if(Val>Bestval)														// new best value found
   {
-   Bestval=Val; *Bestm=Mov&0xFFBF;										// new best value and best move
-   if(!Ply)																// root but no helper
+   Bestval=Val; *Bestm=Mov&0xFFBF; 										// new best value and best move
+   if(!Ply)																// root
    {
-   	Gm->Move2Make=Mov; Pv[(Dbyte)(PM)]=*Bestm; Gm->Lastval=Val;			// backup bestmove so far
-   	if(Val>Oalpha) PrintPV(Gm,Bestval,Alpha-1,Beta);					// print new PV
-   	Gm->Pmove=(Gm->Moves[Gm->Move_r+1]).Mov;							// ponder move
-	if((Val>=MaxScore-(short)(Gm->idepth)-1)&&(!Ponder)&&(level!=1)) 	// shortest mate found, no ponder, no infinite analysis 
-							Stop=true;	
-   }
+   	Gm->Move2Make=Mov; Gm->Pv[(Dbyte)(PM)]=*Bestm; Gm->Lastval=Val;		// backup bestmove so far
+   	
+   	if(!Gm->Threadn)
+   	{
+   	 if(Val>Oalpha) PrintPV(Gm,Bestval,Alpha-1,Beta);					// print pv
+   	 Gm->Pmove=(Gm->Moves[Gm->Move_r+1]).Mov;							// ponder move
+	 if((Val>=MaxScore-(short)(Gm->idepth)-1)&&(!Ponder)&&(level!=1)) 
+	 	Stop=true;
+	}
+	//else StoreHash(Gm,Val,*Bestm,depth,2);					
+   } 
+   
    if(Val>=Beta)														// move fails high
    {
    	if((!cap)&&(!(Mov&128)))											// bestmove is quiet, no IID
@@ -2881,37 +3783,49 @@ AEL:																	// jump here for AEL pruning
 	  Gm->Killer[Ply][2][0]=Gm->Killer[Ply][1][0];						// backup old killer move
 	  Gm->Killer[Ply][2][1]=Gm->Killer[Ply][1][1];
 	  Gm->Killer[Ply][1][0]=Mov; Gm->Killer[Ply][1][1]=type;			// store new killer move
-	 } 
+	 }
+	 if((Gm->Move_n)&&((Gm->Moves[Gm->Move_n-1]).Mov)&&depth)			// deal with counter moves history
+	  HISTORY[Gm->color][(Gm->Moves[Gm->Move_n-1]).type-1]
+	  		[(Gm->Moves[Gm->Move_n-1]).to&63][type-1][to]+=depth*depth;	// increase counter moves history
     }
 	goto Hash;															// fail high cutoff
    }
+   
+   //if((Val>Alpha)&&(Gm->Threadn)) StoreHash(Gm,Val,*Bestm,depth,2);
   }
+  	
   if(Val>Alpha) Alpha=Val;												// adapt alpha
-  if(Alpha>=MaxScore-Ply) 							 return Alpha;		// mate distance pruning
-  if((!Ply)&&(cm==1)&&(Val<=Oalpha)&&(Gm->idepth>3)) return Val;		// pv move below alpha -> immediate research
+  if(Alpha>=MaxScore-Ply) 							 	return Alpha;	// mate distance pruning
+  if((!Ply)&&(cm==1)&&(Val<=Oalpha)&&(Gm->idepth>3)) 	return Val;		// pv move below alpha -> immediate research
+  if(Gm->idepth<midepth)								return Bestval; // leave search of threads with irrelevant depth
+
  }
 
 Hash:
+
+ if(Gm->idepth<midepth)									return Bestval;	// leave search of threads with irrelevant depth
  
- if((*Bestm)&&(Bestval>Oalpha)&&(Bestval<Beta))	Pv[(Dbyte)(PM)]=*Bestm;	// bestmove exists and pv node, store in pv table	  												
+ if((*Bestm)&&(Bestval>Oalpha)&&(Bestval<Beta))	Gm->Pv[(Dbyte)(PM)]=*Bestm;	// bestmove exists and pv node, store in pv table	  												
  Mov=*Bestm; f=0;														// initialize hash move and flags
  if(Bestval<=Oalpha) {f|=1; Mov=0;} else if(Bestval>=Beta) f|=2;		// upper or lower bound
- StoreHash(Gm,Bestval,Mov,hdepth,f);									// store search results in hash table
+ if(Gm->Threadn) f|=16;													// entry stems from helper
+ if(Ply||(Gm->mpv<2)) StoreHash(Gm,Bestval,Mov,depth,f);				// store search results in hash table
  if((Stop)||(!(*Bestm)))							return Bestval;		// search was interrupted or no bestmove
  to  =(Byte)(((*Bestm)>>8))&63; from=(Byte)((*Bestm)&63); 				// origin and destination of move
  cap =(Gm->Piece[1-Gm->color][to]).type;								// captured piece
  (Gm->Moves[Gm->Move_n]).from=from; (Gm->Moves[Gm->Move_n]).to=to;		// record bestmove
  (Gm->Moves[Gm->Move_n]).cap=cap;										// move captures?
  (Gm->Moves[Gm->Move_n]).Mov=*Bestm;									// backup compressed move
+ (Gm->Moves[Gm->Move_n]).type=(Gm->Piece[Gm->color][from]).type;
  if((*Bestm)&128) (Gm->Moves[Gm->Move_n]).prom=(Byte)((*Bestm)>>14)+2;	// move is promotion?
- else 				 (Gm->Moves[Gm->Move_n]).prom=0;
+ else 				 (Gm->Moves[Gm->Move_n]).prom=0; 
  if((depth>6)&&(!cap)&&(!((*Bestm)&128))&&(Bestval>=Oalpha)&&Gm->Move_n)// update counter table for larger depths only
  {
   to=(Gm->Moves[Gm->Move_n-1]).to&63;									// previous move's destination
   if((Gm->Piece[1-Gm->color][to]).type<6) 								// officer move
    Gm->Counter[Gm->color][(Gm->Piece[1-Gm->color][to]).index][to]=		// store officer counter move
    														*Bestm;
-  else Gm->Counter[Gm->color][16][to]=*Bestm;							// store pawn counter move
+  else Gm->Counter[Gm->color][16][to]=*Bestm;							// store pawn counter move	  		 
  }
  return Bestval;
 }
@@ -2919,119 +3833,317 @@ Hash:
 void	*SmpSearchHelper(void* Ms)
 {
  Game*	Gm=(Game*)(Ms);
+ NNUE	Nn;
+ Byte	d;
  
- Gm->Finished=false;
+ Gm->Finished=false; 
+ if(Options[8].Val) NNUE_InitFeatures(Gm,&Nn,3); 		                // init NNUE features
  while(!Stop)
  {
-  Gm->noloose=0; Gm->NODES=0; 
-  Gm->idepth=midepth+1+Gm->Threadn/2;									// set thread parameters
-  Search(Gm,Malpha,Mbeta,Gm->idepth,&(Gm->Bestmove));					// search with open window
+  Gm->noloose=0; Gm->NODES=0; d=((Gm->Threadn-1)%3)+1;					// d=1,2,3,1,2,3,1,2,3...
+  if((Gm->idepth<=midepth)&&(254-d>midepth)) Gm->idepth=d+midepth;		// set thread parameters
+  else if(254-d>Gm->idepth) Gm->idepth+=d;			
+  Search(Gm,&Nn,Malpha,Mbeta,Gm->idepth,&(Gm->Bestmove));				// search with open window
+  //Search(Gm,&Nn,Malpha-1,Mbeta+1,Gm->idepth,&(Gm->Bestmove));				// search with open window
+  //Search(Gm,&Nn,-MaxScore,MaxScore,Gm->idepth,&(Gm->Bestmove));				// search with open window
+ 
  }
  Gm->Finished=true;
+ 
+ return 0;
 }
 
 void	IterateSearch(Game* Gm)											// search for best move
 {
  Mvs			Mv;
- BitMap			BM;
+ NNUE			Nn;
+ BitMap			BM,HM;
  int			i,j,Nm;
  Byte			md;
  Fbyte			Tplan;
  Dbyte			Prevmove,Bm,Bm1;
  Game			Gp[Paras[93].Val];
- short			Val;
+ short			Val,Val2;
  
- Malpha=-MaxScore; Mbeta=MaxScore; md=255; Prevmove=0; Gm->Threadn=0;   // initialize local values
+ Malpha=-MaxScore; Mbeta=MaxScore; md=254; Prevmove=0; Gm->Threadn=0;   // initialize local values
+ if(maxdepth>254) maxdepth=254;
  			
  if((Gm->color&&Binc)||((1-Gm->color)&&Winc)) 							// time increment for every move?
   						Nm=Paras[91].Val; else Nm=Paras[90].Val;		// set number of moves for sudden death
  BM=(Gm->Moves[Gm->Move_n]).HASH; BM^=(BM>>32); BM^=(BM>>16); 			// compress hash signature
  
- StartTime=clock();	Maxply=0; ALLNODES=0; Pv[(Dbyte)(BM)]=0;			// initialize global values
+ StartTime=1000*clock()/CLOCKS_PER_SEC;	                                // start time in milliseconds
+ Gm->Maxply=0; ALLNODES=0; Gm->Pv[(Dbyte)(BM)]=0;	                    // initialize global values
  
  Stop=false; Gm->Move2Make=0; Gm->Lastbest=0; Gm->Pmove=0;				// initialize game parameters
  Gm->Move_r=Gm->Move_n;
  
- if(level!=1) if(Gm->Move2Make=Book(Gm)) 						return;	// get move from opening book
- 
- GenMoves(Gm,&Mv); if(!Mv.cp) 									return;	// no moves possible
- Mv.s=200; Mv.o=Mv.flg=i=0;												// prepare move picker
- 
- while(Gm->Rootmvs[i]=PickMove(Gm,&Mv)) Gm->TREESIZE[i++]=1;            // init treesizes
- if((i<2)&&(level!=1)&&(!Ponder)) {Gm->Move2Make=Gm->Rootmvs[0]; return;} // one legal move only
- for(BM=0;BM<2*HEN;BM++) hash_t[16*BM+1]|=0x08;							// set age-flag
- for(i=0;i<256;i++) 
-  Gm->Killer[i][0][0]=Gm->Killer[i][1][0]=Gm->Killer[i][2][0]=0;		// clear killer list
- //for(BM=0;BM<   PVN;BM++) 			 Pv[BM]=0; 							// clear pv table
+ if(Options[3].Val)														// debug 
+ {
+  DebugEval(Gm);														// show parameter influence on eval
+  return;
+ }
  
  switch(level)															// set time control
  {
-  case 0: if(Gm->color) Tmax=Paras[92].Val*Btime/(Movestogo+1)+1; 		// ordinary time control
-  		  else 			Tmax=Paras[92].Val*Wtime/(Movestogo+1)+1; break;// hard break at 5-times average
-  case 2: if(Gm->color) Tmax=Paras[92].Val*Btime/Nm+1;					// sudden death, estimate x moves to go
-  		  else			Tmax=Paras[92].Val*Wtime/Nm+1;			break;	// hard break at 5 times average  
+  case 0: if(Gm->color) if(Btime<3000) Tmax=1;
+  						else Tmax=Paras[92].Val*Btime/(Movestogo+1)+1; 	// ordinary time control
+  		  else 			if(Wtime<3000) Tmax=1;
+						else Tmax=Paras[92].Val*Wtime/(Movestogo+1)+1; 
+																break;  // hard break at n-times average
+  case 2: if(Gm->color) if(Btime<3000) Tmax=1;
+  						else Tmax=Paras[92].Val*Btime/(Nm+1)+1;			// sudden death, estimate x moves to go
+  		  else			if(Wtime<3000) Tmax=1;
+						else Tmax=Paras[92].Val*Wtime/(Nm+1)+1;	break;	// hard break at n times average  
   case 3: md=maxdepth;  Tmax=0;									break;	// depth limit
   case 6: 				Tmax=Movetime;							break;	// hard break is movetime
   default:				Tmax=0;									break;	// infinite: no hard break
  }
- Tmax*=CLOCKS_PER_SEC/1000;												// transform to clock cycles 
  
- midepth=3; 
+ if((level!=1)&&((Gm->Move_r<40)||(Tmax>4000)))							// if there is not enought time  ... 
+  if(Gm->Move2Make=Book(Gm)) 	{printf("info string Book\n"); return;}	// ... check book only for first 20 moves 
+ 
+ if(((!(Gm->Root[1]).Mov))&&(level!=1)&&(!Ponder)) 						// one legal move only
+  {Gm->Move2Make=(Gm->Root[0]).Mov; return;} 	
+ 
+ midepth=0; Mval=0;
+ 
  for(i=0;i<Paras[93].Val;i++) 											// initialize threads
  {
-  Gp[i]=*Gm; Gp[i].Threadn=i+1; 
+  Gp[i]=*Gm; Gp[i].Threadn=i+1; Gp[i].idepth=8;
   pthread_create(&(Gp[i].Tid), NULL, SmpSearchHelper, (void*)(Gp+i));	// create new helper thread
  }
-
+ 
+ if(Options[8].Val) NNUE_InitFeatures(Gm,&Nn,3);			            // initialize NNUE feature- and index vector
+  
  for(Gm->idepth=1;Gm->idepth<=md;Gm->idepth++)							// iteration
  { 
-  Gm->noloose=0; Gm->NODES=0; midepth=Gm->idepth;						// set parameters
- 
-  //for(i=0;i<250;i++) for(j=0;j<Paras[93].Val;j++) 
-  // Gm->TREESIZE[i]+=Gp[j].TREESIZE[i];								// add complexity of move from all helpers
-   
-  if(!Stop) 
-   Val=Search(Gm,Malpha,Mbeta,midepth,&(Gm->Bestmove));					// search with open window
-  if(!Stop) 
+  Gm->NODES=0; midepth=Gm->idepth; Gm->noloose=0;						// set parameters
+  if(Paras[98].Val>1) Gm->mpv=1; else Gm->mpv=0;						// prepare MultiPV
+  
+  if(!Stop)
+   Val=Search(Gm,&Nn,Malpha,Mbeta,midepth,&Bm);							// search with open window
+  if(!Stop)
   {
-   PrintPV(Gm,Val,Malpha,Mbeta); Gm->Lastval=Val;						// print pv
-  	
+   PrintPV(Gm,Val,Malpha,Mbeta);  										// print PV						 	
    if(Val<=Malpha)														// fail low
    {
-    Gm->noloose=0; Malpha=-MaxScore; Mbeta=Val+1;
-    Val=Search(Gm,Malpha,Mbeta,midepth,&(Gm->Bestmove));				// research with half-open lower window
+    Gm->noloose=0;
+    Val=Search(Gm,&Nn,-MaxScore,Val+1,midepth,&Bm);						// research with half-open lower window
     if(!Stop) PrintPV(Gm,Val,-MaxScore,MaxScore);						// print search result
    }
    else if(Val>=Mbeta)													// fail high
    {
-    Gm->noloose=0; Malpha=Val-1; Mbeta=MaxScore;
-    Val=Search(Gm,Malpha,Mbeta,midepth,&(Gm->Bestmove));				// research with half-open upper window
+    Gm->noloose=0;
+    Val=Search(Gm,&Nn,Val-1,MaxScore,midepth,&Bm);						// research with half-open upper window
    }
   }
- 
+  
+  if(Paras[98].Val>1)													// MultiPV
+  {
+   Bm=Bm1=Gm->Pv[(Dbyte)(BM)]; Val2=Val;								// backup PV and value
+   i=0; while((Gm->Root[i]).Mov!=Bm) i++; 
+   (Gm->Root[i]).Order=(BitMap)(0x8FFFFFFFFFFFFFFF)-(BitMap)(Gm->mpv); 	// set move order
+   (Gm->Root[i]).flags|=2;									
+   for(Gm->mpv=2;Gm->mpv<=Paras[98].Val;(Gm->mpv)++) 					// determine next best moves
+   {
+   	if(Stop) break;
+    Val=Search(Gm,&Nn,-MaxScore,MaxScore,midepth,&Bm);					// research with half-open upper window
+    if(Val>Val2) {Bm1=Bm; Val2=Val;}
+    i=0; while((Gm->Root[i]).Mov!=Bm) i++;
+    (Gm->Root[i]).Order=(BitMap)(0x8FFFFFFFFFFFFFFF)-(BitMap)(Gm->mpv); // set move order
+	(Gm->Root[i]).flags|=2;	
+    PrintPV(Gm,Val,-MaxScore,MaxScore);									// print search result
+   }
+   for(i=0;i<250;i++) 													// restore rootmove list
+   {
+    if((!((Gm->Root[i]).flags&2))&&((Gm->Root[i]).Order>1)) 			// downgrade old best moves
+	 (Gm->Root[i]).Order-=2*(BitMap)(Paras[98].Val); 
+	(Gm->Root[i]).flags&=0xFC;	
+   }						
+   Val=Val2; Gm->Pv[(Dbyte)(BM)]=Gm->Move2Make=Bm1;						// restore value, PV and best move
+  } 
+
   if(Stop) Val=Gm->Lastval; else Gm->Lastval=Val;						// backup last value
+  
   if(midepth>2) {Malpha=Val-Paras[89].Val; Mbeta=Val+Paras[89].Val;}	// set aspiration window
   else			{Malpha=-MaxScore; Mbeta=MaxScore;}						// maximal window
   if(Val<255-MaxScore) Malpha=-MaxScore; 								// at most some mate against stm
-  if(Val>MaxScore-255) Mbeta=MaxScore;									// at least some mate for stm	
+  if(Val>MaxScore-255) Mbeta=MaxScore;									// at least some mate for stm
   if(((midepth>=MaxScore-Val-1)||(midepth>=MaxScore+Val))				// shortest mate found
   	 &&(level!=1)) 								Stop=true;
   if(Gm->color) Tplan=Btime+Binc; else Tplan=Wtime+Winc;				// time left
-  Tplan*=CLOCKS_PER_SEC/2000;											// transform to clock cycles
+ 
+  if(Tplan<3000) Tplan=10;												// less than 3 seconds left: move immediately
+  Tplan/=2;									
+
   if(!Ponder) switch(level)												// plan another iteration
   {
-   case 0: if((Fbyte)(clock()-StartTime)>(Tplan/(Movestogo+1)))			// ordinary time control
-   											Stop=true; 		break;
-   case 2: if((Fbyte)(clock()-StartTime)>(Tplan/(Nm+1)))				// sudden death
-   											Stop=true; 		break;
+   case 0: if((Fbyte)(1000*clock()/CLOCKS_PER_SEC-StartTime)>           // ordinary time control
+                (Tplan/(Movestogo+1)))		Stop=true; 		break;
+   case 2: if((Fbyte)(1000*clock()/CLOCKS_PER_SEC-StartTime)>           // sudden death
+                (Tplan/(Nm+1)))				Stop=true; 		break;
    case 3: if(Gm->idepth>=maxdepth)			Stop=true; 		break;		// maximum depth reached
   }
-  //if(Stop)	{PrintPV(Gm,Val,-MaxScore,MaxScore); 		return;}		// print pv and return
+
   if(Gm->Move2Make!=Prevmove) Gm->Lastbest=Prevmove;					// best move has changed
   Prevmove=Gm->Move2Make;												// backup last best move
-  if(Stop) 																// stop recognized
-   {for(i=0;i<Paras[93].Val;i++) pthread_join(Gp[i].Tid,NULL); return;}	// stop helpers 															
- } 
+  if(Stop) break;														// stop iteration										
+ }
+ 
+ Stop=true; Gm->mpv=0; PrintPV(Gm,Val,-MaxScore,MaxScore);				// print pv
+ for(i=0;i<Paras[93].Val;i++) pthread_join(Gp[i].Tid,NULL);				// stop helpers
+ 
+ if(Gm->Move2Make)														// we have a move
+ {
+  if(!(Gm->Pmove))														// get pondermove if missing
+  {
+   GenMoves(Gm,&Mv); Move(Gm,Gm->Move2Make); GenMoves(Gm,&Mv);			// make best move
+   Mv.o=Mv.s=0; Gm->Pmove=PickMove(Gm,&Mv); UnMove(Gm);					// pick first reply as pondermove
+  }
+ } else {GenMoves(Gm,&Mv); Mv.o=Mv.s=0;Gm->Move2Make=PickMove(Gm,&Mv);}	// get any move if bestmove is missing
+ 
+ return;
+}
+
+void	FindMate(Game* Gm)
+{
+ Mvs			Mv;
+ Game			Gp[Paras[93].Val];
+ Byte 			i,cm;
+ short			Bestval;
+ bool			mcheck;
+ Dbyte			Mov,Bestmove,sol=0;
+
+ StartTime=clock(); Gm->Maxply=Gm->idepth=2*nmate-1; Gm->Lastbest=0;	// init values
+ ALLNODES=Gm->NODES=0; Gm->Finished=true; Stop=false; ClearTables();
+ Gm->Move2Make=0;
+ for(i=0;i<Paras[93].Val;i++) {Gp[i]=*Gm; Gp[i].Threadn=i+1;}			// initialize threads
+ GenMoves(Gm,&Mv); 														// generate moves
+ if((!(Mv.cp))||(Mv.cp==64)||(Mv.cp==128)||(Mv.cp==192)) return;		// stalemate or mate
+ Mv.o=cm=0; Mv.s=200; Bestval=-MaxScore; Bestmove=0;					// init move picker
+ 
+ if(Options[0].Val)														// UCI mode
+  printf("info string using %d threads to find mate in %d ...\n",
+  	Paras[93].Val,nmate);
+ else printf("using %d threads to find mate in %d ...\n",				// terminal mode
+ 	Paras[93].Val,nmate);	
+ 
+ while(Mov=PickMove(Gm,&Mv))											// loop through moves
+ { 
+  cm++; mcheck=false; 
+  while(!mcheck) 
+  {
+   usleep(10000); if(Stop) return;										// prevent high cpu load of main thread
+   for(i=0;i<Paras[93].Val;i++) if(Gp[i].Finished)						// check for free thread
+   {  	
+   	PrintCurrent(Gm,Mov,cm);											// print move to analyse
+   	if(Gp[i].Lastval>Bestval) 											// record best move
+	 {Bestval=Gp[i].Lastval; Bestmove=Gp[i].Lastbest;}
+    if((Gp[i].Lastbest)&&(Gp[i].Lastval>=MaxScore-Gp[i].idepth)) 		// move is solution
+     {PrintPV(Gp+i,Gp[i].Lastval,-MaxScore,MaxScore); sol++;}			// show solution
+    Gp[i].Lastbest=Mov; mcheck=true; Gp[i].Finished=false;				// current move is going to be analysed	
+    pthread_create(&(Gp[i].Tid), NULL, SmpMateHelper, (void*)(Gp+i));	// create new helper thread
+    break;
+   }
+  }
+ }
+ for(i=0;i<Paras[93].Val;i++) 											// parse running threads
+ {
+  pthread_join(Gp[i].Tid,NULL);											// wait for thread to finish
+  if(Gp[i].Lastval>Bestval) 											// record best move
+	 {Bestval=Gp[i].Lastval; Bestmove=Gp[i].Lastbest;}
+  if((Gp[i].Lastbest)&&(Gp[i].Lastval>=MaxScore-Gp[i].idepth)&&(!Stop)) // move is solution
+   {PrintPV(Gp+i,Gp[i].Lastval,-MaxScore,MaxScore);	sol++;}				// show solution
+ }
+ Gm->Move2Make=Bestmove;												// suggest best move
+ 
+ if(Options[0].Val)														// UCI mode
+  printf("info string found %d solutions for mate in %d\n",sol,nmate);
+ else printf("found %d solutions for mate in %d\n",sol,nmate);			// terminal mode	
+}
+
+void	*SmpMateHelper(void* Ms)
+{
+ Game*	Gm=(Game*)(Ms);
+ BitMap	PM;
+ 
+ Move(Gm,Gm->Lastbest); ALLNODES++;	(Gm->NODES)++;						// make move
+ Gm->Lastval=-MateSearch(Gm,-MaxScore,MaxScore,Gm->idepth-1);			// iterative search
+ UnMove(Gm); 															// unmake move
+ PM=(Gm->Moves[Gm->Move_n]).HASH; PM^=(PM>>32); PM^=(PM>>16);			// fold hash signature to 16 bit}
+ Gm->Pv[(Dbyte)(PM)]=Gm->Lastbest;	Gm->Finished=true;					// store PV
+ 
+ return 0;
+}
+
+short	MateSearch(Game* Gm, short Alpha, short Beta, Byte depth)
+{
+ Mvs			Mv;
+ short			Bestval,Ply,Val,Oalpha;
+ BitMap 		HM,PM,AM;
+ Dbyte			Mov,Bestmove;
+ Byte			cm,f,hd;
+ 
+ if((!depth)&&(!TestCheck(Gm,99)))						return 0;		// not in check at maximum ply
+ if(DrawTest(Gm)) 										return 0;		// draw according to 3 or 50 moves
+ 
+ Ply=(short)(Gm->Move_n-Gm->Move_r); Oalpha=Alpha;
+																		
+ if(depth&&(HM=GetHash(Gm)))											// check transposition table
+ {
+  hd=(Byte)(HM); f=(Byte)(HM>>8); Val=(short)(HM>>16);					// get depth, flags, value and move 
+  Bestmove=Mv.Bestmove=(Dbyte)((HM>>32)&0xFFBF);						// we have a TT value and move
+  
+  if(Val>(short)(MaxScore-255))		 									// positive mate score
+   {Val-=Ply; if((!(f&1))&&(Val>=Beta)) return Val;}					// adjust value	
+  else if(Val<(short)(255-MaxScore)) 
+   {Val+=Ply; if((!(f&2))&&(Val<=Alpha)) return Val;}					// adjust value
+  							
+  if(depth<=hd)															// hashdepth sufficient
+   if(f&1) 		{if(Val<=Alpha) return Val; if(Val<Beta)  Beta=Val;}	// upper bound
+   else if(f&2) {if(Val>=Beta)  return Val; if(Val>Alpha) Alpha=Val;}	// lower bound
+   else							return Val;								// exact value
+  if(Beta<=Alpha)				return Alpha;							// hash cutoff	
+ }
+ 
+ if(Alpha>=MaxScore-Ply)								return Val;		// mate distance pruning
+ 
+ PM=(Gm->Moves[Gm->Move_n]).HASH; PM^=(PM>>32); PM^=(PM>>16);			// fold hash signature to 16 bit
+ 
+ GenMoves(Gm,&Mv); 														// generate moves
+ if(!(Mv.cp))								 			return 0;		// stalemate
+ if((Mv.cp==64)||(Mv.cp==128)||(Mv.cp==192)) return Ply-MaxScore; 		// mate
+ 
+ if(!depth)												return 0;		// maximum ply without mate
+
+ Mv.o=cm=0; Bestval=-MaxScore;											// init move picker
+ if(Ply&1) Mv.s=220; else Mv.s=199;										// defender tries to give check
+ 
+ while(Mov=PickMove(Gm,&Mv))											// loop through moves
+ {
+  if(Stop) 												return Bestval;	// stop detected
+  Move(Gm,Mov);	ALLNODES++;	(Gm->NODES)++;								// make move
+  Val=-MateSearch(Gm,-Beta,-Alpha,depth-1);								// iterative search
+  UnMove(Gm);															// take back move
+  cm++;
+  
+  if(Val>Bestval)														// new best value found
+  { 
+   Bestmove=Mov&0xFFBF; Gm->Pv[(Dbyte)(PM)]=Bestmove; Bestval=Val;		// new best value and best move
+   if(Val>=Beta)										goto HashM;		// move fails high  
+  }
+  if(Val>Alpha) Alpha=Val;												// adapt alpha
+  if(Alpha>=MaxScore-Ply) 							 	return Alpha;	// mate distance pruning
+ }
+  							
+ HashM:
+ 	
+ f=0; if(Bestval<=Oalpha) {f|=1; Mov=0;} else if(Bestval>=Beta) f|=2;	// upper or lower bound
+ StoreHash(Gm,Bestval,Bestmove,depth,f);
+ if((Bestval>Oalpha)&&(Bestmove)&&(Bestval<Beta))	
+  Gm->Pv[(Dbyte)(PM)]=Bestmove;													
+ 														return Bestval;	// return value
 }
 
 short 	KvK(Game* Gm, Byte *flags)										// lone kings: checked
@@ -3050,7 +4162,7 @@ short 	KPvK(Game* Gm, Byte *flags)										// checked
  Byte 	wp,mwk,mbk,bk,wk;	
  BitMap AM,BM=Gm->POSITION[0][6];										// white pawn(s)
 
- Val=(Gm->Count[0]).pawns*Paras[9].Val; AM=BM;							// material value of pawns
+ Val=(Gm->Count[0]).pawns*Paras[105].Val; AM=BM;							// material value of pawns
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
  
  while(BM)
@@ -3066,7 +4178,7 @@ short 	KPvK(Game* Gm, Byte *flags)										// checked
   }
   if((A8<<mwk)&KPVK[((wp>>3)-1)*4+(wp&3)][Gm->color*64+mbk])			// position is won
   {
-   Val+=Paras[5].Val-Paras[9].Val-100;									// value is queen-pawn-promotion bonus
+   Val+=Paras[101].Val-Paras[105].Val-100;								// value is queen-pawn-promotion bonus
    *flags=0; if(Gm->color) return -Val; else return Val;				// evaluation depends on stm
   }
  }
@@ -3081,7 +4193,7 @@ short 	KvKP(Game* Gm, Byte *flags)										// checked
  Byte 	bp,mwk,mbk,wk,bk;
  BitMap AM,BM=Gm->POSITION[1][6];										// black pawn(s)
  
- Val=(Gm->Count[1]).pawns*Paras[9].Val; AM=BM;							// material value of pawns
+ Val=(Gm->Count[1]).pawns*Paras[105].Val; AM=BM;						// material value of pawns
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
 
  while(BM)
@@ -3098,7 +4210,7 @@ short 	KvKP(Game* Gm, Byte *flags)										// checked
   
   if((A8<<mbk)&KPVK[((bp>>3)-1)*4+(bp&3)][(1-Gm->color)*64+mwk])		// position is won
   {
-   Val+=Paras[5].Val-Paras[9].Val-100;									// value is queen-pawn-promotion bonus
+   Val+=Paras[101].Val-Paras[105].Val-100;								// value is queen-pawn-promotion bonus
    *flags=0; if(Gm->color) return Val; else return -Val;				// evaluation depends on stm
   }
  }
@@ -3121,7 +4233,7 @@ short 	KNvK(Game* Gm, Byte *flags)										// white has knight(s)
  while(WN)																// parse knights
  {
   n=find_b[(WN^WN-1)%67]; WN&=WN-1; 									// next knight
-  Val+=38+Paras[8].Val-4*Dist_c[n]-Dist_s[bk][n]; 						// distance of knight to bK and center
+  Val+=38+Paras[104].Val-4*Dist_c[n]-Dist_s[bk][n]; 					// distance of knight to bK and center
  }
  if(Gm->color) return -Val; else return Val;
 }
@@ -3140,7 +4252,7 @@ short 	KvKN(Game* Gm, Byte *flags)										// black has knight(s)
  while(BN)																// parse knights
  {
   n=find_b[(BN^BN-1)%67]; BN&=BN-1; 									// next knight
-  Val+=38+Paras[8].Val-4*Dist_c[n]-Dist_s[wk][n]; 						// distance of knight to wK and center
+  Val+=38+Paras[104].Val-4*Dist_c[n]-Dist_s[wk][n]; 					// distance of knight to wK and center
  }
  if(Gm->color) return Val; else return -Val;
 }
@@ -3154,7 +4266,7 @@ short 	KBvK(Game* Gm, Byte *flags)
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
  if(!((BM&WS)&&(BM&BS))) {*flags=0; return Paras[74].Val;}				// lone bishop or all on same color
  Val=50+20*Dist_c[bk]-5*Dist[wk][bk];									// distance of kings, score
- while(BM) {BM&=BM-1; Val+=Paras[7].Val;}								// add material value of bishops				
+ while(BM) {BM&=BM-1; Val+=Paras[103].Val;}								// add material value of bishops				
  if(Gm->color) {*flags=1; Val=-Val;} else *flags=2;						// black has at most pos val maybe lost
  if(STEP[1][bk]&Gm->POSITION[0][0]) *flags=64;							// bishop under attack: no guess
  return Val;
@@ -3169,7 +4281,7 @@ short 	KvKB(Game* Gm, Byte *flags)
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
  if(!((BM&WS)&&(BM&BS))) {*flags=0; return Paras[74].Val;}				// lone bishop or all on same color
  Val=50+20*Dist_c[wk]-5*Dist_s[wk][bk];									// distance of kings, score
- while(BM) {BM&=BM-1; Val+=Paras[7].Val;}								// add material value of bishops				
+ while(BM) {BM&=BM-1; Val+=Paras[103].Val;}								// add material value of bishops				
  if(Gm->color) *flags=2; else {*flags=1; Val=-Val;}						// black has at least pos val maybe won
  if(STEP[1][wk]&Gm->POSITION[1][0]) *flags=64;							// bishop under attack: no guess
  return Val;															// white has at most pos valmaybe lost
@@ -3183,9 +4295,9 @@ short 	KRvK(Game* Gm, Byte *flags)										// also KR(B/N)vK
  
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
  Val=120+20*Dist_c[bk]-5*Dist_s[bk][wk];								// distance of kings, score
- while(BM) {Val+=20+Paras[6].Val; BM&=BM-1;}							// add material value of rooks
- BM=Gm->POSITION[0][4]; while(BM) {Val+=20+Paras[7].Val; BM&=BM-1;}		// add material value of bishops
- BM=Gm->POSITION[0][5]; while(BM) {Val+=20+Paras[8].Val; BM&=BM-1;}		// add material value of knights
+ while(BM) {Val+=20+Paras[102].Val; BM&=BM-1;}							// add material value of rooks
+ BM=Gm->POSITION[0][4]; while(BM) {Val+=20+Paras[103].Val; BM&=BM-1;}	// add material value of bishops
+ BM=Gm->POSITION[0][5]; while(BM) {Val+=20+Paras[104].Val; BM&=BM-1;}	// add material value of knights
  if(Gm->color) {*flags=1; Val=-Val;} else *flags=2;						// white has at least pos val maybe won
  if(STEP[1][bk]&Gm->POSITION[0][0]) *flags=64;							// pieces under attack: no guess
  return Val;															// black has at most pos val maybe lost
@@ -3199,9 +4311,9 @@ short 	KvKR(Game* Gm, Byte *flags)										// also KvKR(B/N)
  
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
  Val=120+20*Dist_c[wk]-5*Dist_s[bk][wk];								// distance of kings, score
- while(BM) {Val+=20+Paras[6].Val; BM&=BM-1;}							// add material value of rooks
- BM=Gm->POSITION[1][4]; while(BM) {Val+=20+Paras[7].Val; BM&=BM-1;}		// add material value of bishops
- BM=Gm->POSITION[1][5]; while(BM) {Val+=20+Paras[8].Val; BM&=BM-1;}		// add material value of knights
+ while(BM) {Val+=20+Paras[102].Val; BM&=BM-1;}							// add material value of rooks
+ BM=Gm->POSITION[1][4]; while(BM) {Val+=20+Paras[103].Val; BM&=BM-1;}	// add material value of bishops
+ BM=Gm->POSITION[1][5]; while(BM) {Val+=20+Paras[104].Val; BM&=BM-1;}	// add material value of knights
  if(Gm->color) *flags=2; else {*flags=1; Val=-Val;}						// black has at least pos val maybe won
  if(STEP[1][wk]&Gm->POSITION[1][0]) *flags=64;							// pieces under attack: no guess
  return Val;															// white has at most pos val maybe lost
@@ -3215,10 +4327,10 @@ short 	KQvK(Game* Gm, Byte *flags)										// also KQ(R/B/N)vK
  
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
  Val=200+15*Dist_c[bk]-10*Dist_s[bk][wk];								// distance of kings, score
- while(BM) {Val+=20+Paras[5].Val; BM&=BM-1;}							// add material value of queens
- BM=Gm->POSITION[0][3]; while(BM) {Val+=20+Paras[6].Val; BM&=BM-1;}		// add material value of rooks
- BM=Gm->POSITION[0][4]; while(BM) {Val+=20+Paras[7].Val; BM&=BM-1;}		// add material value of bishops
- BM=Gm->POSITION[0][5]; while(BM) {Val+=20+Paras[8].Val; BM&=BM-1;}		// add material value of knights
+ while(BM) {Val+=20+Paras[101].Val; BM&=BM-1;}							// add material value of queens
+ BM=Gm->POSITION[0][3]; while(BM) {Val+=20+Paras[102].Val; BM&=BM-1;}	// add material value of rooks
+ BM=Gm->POSITION[0][4]; while(BM) {Val+=20+Paras[103].Val; BM&=BM-1;}	// add material value of bishops
+ BM=Gm->POSITION[0][5]; while(BM) {Val+=20+Paras[104].Val; BM&=BM-1;}	// add material value of knights
  if(Gm->color) {*flags=1; Val=-Val;} else *flags=2;						// black has at least pos value
  if(STEP[1][bk]&Gm->POSITION[0][0]) *flags=64;							// pieces under attack: no guess
  return Val;															// black has at most pos val maybe lost
@@ -3232,10 +4344,10 @@ short 	KvKQ(Game* Gm, Byte *flags)										// also KvKQ(R/B/N)
 
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
  Val=200+15*Dist_c[wk]-10*Dist_s[bk][wk];								// distance of kings, score
- while(BM) {Val+=20+Paras[5].Val; BM&=BM-1;}							// add material value of queens
- BM=Gm->POSITION[1][3]; while(BM) {Val+=20+Paras[6].Val; BM&=BM-1;}		// add material value of rooks
- BM=Gm->POSITION[1][4]; while(BM) {Val+=20+Paras[7].Val; BM&=BM-1;}		// add material value of bishops
- BM=Gm->POSITION[1][5]; while(BM) {Val+=20+Paras[8].Val; BM&=BM-1;}		// add material value of knights
+ while(BM) {Val+=20+Paras[101].Val; BM&=BM-1;}							// add material value of queens
+ BM=Gm->POSITION[1][3]; while(BM) {Val+=20+Paras[102].Val; BM&=BM-1;}	// add material value of rooks
+ BM=Gm->POSITION[1][4]; while(BM) {Val+=20+Paras[103].Val; BM&=BM-1;}	// add material value of bishops
+ BM=Gm->POSITION[1][5]; while(BM) {Val+=20+Paras[104].Val; BM&=BM-1;}	// add material value of knights
  if(Gm->color) *flags=2; else {*flags=1; Val=-Val;}						// black has at least pos value
  if(STEP[1][wk]&Gm->POSITION[1][0]) *flags=64;							// pieces under attack: no guess
  return Val;															// white has at most pos val maybe lost
@@ -3255,9 +4367,9 @@ short 	KBNvK(Game* Gm, Byte *flags)									// white has bishop(s) and knight(s)
  while(WN)																// parse knights
  {
   n=find_b[(WN^WN-1)%67]; WN&=WN-1;										// next knight
-  Val+=34+Paras[8].Val-Dist_s[bk][n]; 									// material and distance of knight to bK
+  Val+=34+Paras[104].Val-Dist_s[bk][n]; 								// material and distance of knight to bK
  }
- while(WB) {Val+=20+Paras[7].Val; WB&=WB-1;}							// add bishop's material value	
+ while(WB) {Val+=20+Paras[103].Val; WB&=WB-1;}							// add bishop's material value	
  if(Gm->color) return -Val; else return Val;							// black has at most pos val maybe lost
 }
 
@@ -3275,9 +4387,9 @@ short 	KvKBN(Game* Gm, Byte *flags)									// black has bishop(s) and knight(s)
  while(BN)																// parse knights
  {
   n=find_b[(BN^BN-1)%67]; BN&=BN-1;										// next knight
-  Val+=34+Paras[8].Val-Dist_s[wk][n]; 									// material and distance of knight to wK
+  Val+=34+Paras[104].Val-Dist_s[wk][n]; 								// material and distance of knight to wK
  }
- while(BB) {Val+=20+Paras[7].Val; BB&=BB-1;}							// add bishop's material value	
+ while(BB) {Val+=20+Paras[103].Val; BB&=BB-1;}							// add bishop's material value	
  if(Gm->color) return Val; else return -Val;							// white has at most pos val maybe lost
 }
 
@@ -3314,7 +4426,7 @@ short 	KBPvK(Game* Gm, Byte *flags)
  
  if(((Gm->Count[0]).officers>2)||(((~A)&WP)&&((~H)&WP))) return 0;		// more than one bishop or pawns not on a/h files
  *flags=64;																// default is unclear
- Val=3*n*n+(Gm->Count[0]).pawns*Paras[9].Val;							// value of pawn(s)
+ Val=3*n*n+(Gm->Count[0]).pawns*Paras[105].Val;							// value of pawn(s)
  Val+=2*Dist[bk][wps]-Dist[wk][wps];									// distance to pawn
  if(Gm->color) p=0; else p=8;											// stm correction for Berger
  if((!(BKB&PAWN_E[0][2][wps-p]))&&
@@ -3343,7 +4455,7 @@ short 	KvKBP(Game* Gm, Byte *flags)
  *flags=64;																// default is unclear
  while(BP) {bps=find_b[(BP^BP-1)%67]; BP&=BP-1;}						// most advanced pawn
  n=bps>>3;																// rank of that pawn															
- Val=3*n*n+(Gm->Count[1]).pawns*Paras[9].Val;							// value of pawn(s)
+ Val=3*n*n+(Gm->Count[1]).pawns*Paras[105].Val;							// value of pawn(s)
  Val+=2*Dist[wk][bps]-Dist[bk][bps];									// distance to pawn
  
  if(Gm->color) p=8; else p=0;											// stm correction for Berger
@@ -3367,15 +4479,16 @@ short 	KPvKB(Game* Gm,Byte *flags)
  Byte 	n=7-(wps>>3);													// pawn's rank
  
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
- if(((BM&WS)&&(BM&BS))||((Gm->Count[0]).pawns>1)||						// more than one bishop or pawn or
- 	(Gm->POSITION[0][1]&(PM>>8)&COR))	{*flags=128; return 0;}			// wK trapped: back off 
+ if(((Gm->Count[1]).officers>3)||((Gm->Count[0]).pawns>1)||				// more than two bishops or one pawn or
+ 	(Gm->POSITION[0][1]&(PM>>8)&COR)||((BM&WS)&&(BM&BS)))				// wK trapped or differently colored bishops:  
+  {*flags=128; return 0;}												// back off
  if(!(Gm->POSITION[1][1]&COR))											// bK not in corner
  {
   Val=KPvK(Gm,flags); 													// check position without bishop
   if((Val==Paras[74].Val)&&(*flags==0)) return Val; 					// position draw even without bishop
  }											
- Val=2*Dist_s[bk][wps]-Dist_s[wk][wps]-Paras[7].Val;					// material value of bishop
- Val+=3*n*n+Paras[9].Val;												// value of pawn
+ Val=2*Dist_s[bk][wps]-Dist_s[wk][wps]-Paras[103].Val;					// material value of bishop
+ Val+=3*n*n+Paras[105].Val;												// value of pawn
  Val=Val<Paras[74].Val?Paras[74].Val:Val;								// white has at least a draw
  if(Gm->color) {*flags=1; Val=-Val;} else *flags=2;
  if(BM&(STEP[1][wk]|STEP[3][wps]))			*flags=64;					// bishop is attacked
@@ -3393,15 +4506,16 @@ short 	KBvKP(Game* Gm,Byte *flags)
  Byte 	n=bps>>3;														// pawn's rank
  
  bk=(Gm->Officer[1][0]).square;	wk=(Gm->Officer[0][0]).square;			// position of kings
- if(((BM&WS)&&(BM&BS))||((Gm->Count[1]).pawns>1)||						// more than one bishop or pawn or
- 	(Gm->POSITION[1][1]&(PM<<8)&COR))	{*flags=128; return 0;}			// wK trapped: back off 
+ if(((Gm->Count[0]).officers>3)||((Gm->Count[1]).pawns>1)||				// more than two bishops or one pawn or
+ 	(Gm->POSITION[1][1]&(PM<<8)&COR)||((BM&WS)&&(BM&BS)))				// wK trapped, differently colored bishops  
+  {*flags=128; return 0;}												// back off
  if(!(Gm->POSITION[0][1]&COR))											// bK not in corner
  {
   Val=KvKP(Gm,flags); 													// check position without bishop
   if((Val==Paras[74].Val)&&(*flags==0)) return Val; 					// position draw even without bishop
  }											
- Val=2*Dist_s[wk][bps]-Dist_s[bk][bps]-Paras[7].Val;					// material value of bishop
- Val+=3*n*n+Paras[9].Val;												// value of pawn
+ Val=2*Dist_s[wk][bps]-Dist_s[bk][bps]-Paras[103].Val;					// material value of bishop
+ Val+=3*n*n+Paras[105].Val;												// value of pawn
  Val=Val<Paras[74].Val?Paras[74].Val:Val;								// white has at least a draw
  if(Gm->color) *flags=2; else {*flags=1; Val=-Val;}
  if(BM&(STEP[1][bk]|STEP[4][bps]))			*flags=64;					// bishop is attacked
@@ -3488,7 +4602,7 @@ short 	KQvKP(Game* Gm, Byte *flags)
 	{if(Gm->color) *flags=2; else *flags=1; Val=70-10*Dist[wk][n];}
  else
  {
-  Val=Paras[5].Val-Paras[9].Val-20*Dist[wk][n];							// progress of wk
+  Val=Paras[101].Val-Paras[105].Val-20*Dist[wk][n];						// progress of wk
   Val-=4*(n>>3)*(n>>3); *flags=64;										// progress of black pawn	
  }
  if(Gm->color) return -Val; else return Val;
@@ -3509,7 +4623,7 @@ short	KPvKQ(Game* Gm, Byte *flags)
 	 {*flags=0; Val=Paras[74].Val;}
  else
  {
-  Val=Paras[5].Val-Paras[9].Val-20*Dist[bk][n];							// progress of bK
+  Val=Paras[101].Val-Paras[105].Val-20*Dist[bk][n];						// progress of bK
   n=7-(n>>3); Val-=4*n*n; *flags=64;									// progress of wP
  }
  if(Gm->color) return Val; else return -Val;										
@@ -3539,7 +4653,7 @@ short 	KPvKP(Game* Gm,Byte *flags)										// checked
  *flags=0;																// exact value
  if((A8<<wk)&KPVKP[((wp>>3)-2)*4+(wp&3)][Gm->color*64+bk])				// position is won for stm
  { 
-  V+=Paras[5].Val-2*Paras[9].Val;										// value is queen-pawn-promotion bonus
+  V+=Paras[101].Val-2*Paras[105].Val;									// value is queen-pawn-promotion bonus
   if(Gm->color) return -V; else return V;								// evaluation depends on stm
  }
  wp=8*(7-(bp>>3))+(bp&7); mwk=wk;                      					// swap pawns and mirror vertically
@@ -3547,7 +4661,7 @@ short 	KPvKP(Game* Gm,Byte *flags)										// checked
  
  if((A8<<wk)&KPVKP[((wp>>3)-2)*4+(wp&3)][(1-Gm->color)*64+bk])			// position is won for opponent
  { 
-  V-=Paras[5].Val-2*Paras[9].Val;										// value is queen-pawn-promotion bonus
+  V-=Paras[101].Val-2*Paras[105].Val;									// value is queen-pawn-promotion bonus
   if(Gm->color) return -V; else return V;								// evaluation depends on stm
  }
  return Paras[74].Val;													// position is draw        
@@ -3639,6 +4753,42 @@ short 	KNvKN(Game* Gm, Byte *flags)
  *flags=128; 															// default is back off
  if((Gm->Count[0]).officers+(Gm->Count[1]).officers>4)		return 0;	// one side has more than one 
  *flags=0; return Paras[74].Val;										// position is draw
+}
+
+short	KQvKR(Game* Gm, Byte *flags)
+{
+ BitMap WQ=Gm->POSITION[0][2],BR=Gm->POSITION[1][3];					// position of queens and rooks
+ Byte   bk=(Gm->Officer[1][0]).square,wk=(Gm->Officer[0][0]).square;	// position of kings
+ Byte   wqs=find_b[(WQ^WQ-1)%67],brs=find_b[(BR^BR-1)%67];				// position of queen and rook
+ short	Val;
+ 
+ *flags=128;															// default is back off
+ if((Gm->Count[0]).officers+(Gm->Count[1]).officers>4) 		return 0;	// more than one piece per side
+ if((WQ&(STEP[1][bk]|STEP[10][brs]))||(BR&(STEP[1][wk]|STEP[11][wqs]))||// or rook queen attacked
+	(BOR&(Gm->POSITION[0][1]|Gm->POSITION[1][1]))) *flags=64;			// king at border
+	
+ Val=Paras[101].Val-Paras[102].Val;										// material value
+ Val+=2*Dist_s[bk][brs]-Dist_s[bk][wk]+15*Dist_c[bk];					// distance of rook to king, king to king...
+ 																		// and king to center
+ return Val; 
+}
+
+short	KRvKQ(Game* Gm, Byte *flags)
+{
+ BitMap BQ=Gm->POSITION[1][2],WR=Gm->POSITION[0][3];					// position of queens and rooks
+ Byte   bk=(Gm->Officer[1][0]).square,wk=(Gm->Officer[0][0]).square;	// position of kings
+ Byte   bqs=find_b[(BQ^BQ-1)%67],wrs=find_b[(WR^WR-1)%67];				// position of queen and rook
+ short	Val;
+ 
+ *flags=128;															// default is back off
+ if((Gm->Count[0]).officers+(Gm->Count[1]).officers>4) 		return 0;	// more than one piece per side
+ if((BQ&(STEP[1][wk]|STEP[10][wrs]))||(WR&(STEP[1][bk]|STEP[11][bqs]))||// or rook queen attacked
+	(BOR&(Gm->POSITION[0][1]|Gm->POSITION[1][1]))) *flags=64;			// king at border
+	
+ Val=Paras[101].Val-Paras[102].Val;										// material value
+ Val+=2*Dist_s[wk][wrs]-Dist_s[bk][wk]+15*Dist_c[wk];					// distance of rook to king, king to king...
+ 																		// and king to center
+ return -Val; 
 }
 
 short 	KRvKR(Game* Gm, Byte *flags)
@@ -3911,7 +5061,7 @@ short 	KRPvKR(Game* Gm, Byte *flags)
  
  if(((Gm->Count[0]).officers+(Gm->Count[1]).officers>4)||				// more than two rooks or pawns in game
   ((Gm->Count[0]).pawns>2))				{*flags=128; return 0;}			// back off
- *flags=64;	Val=(Gm->Count[0]).pawns*Paras[9].Val; PS=WP; lk=bk&7;		// default is unclear, material value
+ *flags=64;	Val=(Gm->Count[0]).pawns*Paras[105].Val; PS=WP; lk=bk&7;	// default is unclear, material value
  while(PS)																// parse white pawns
  {
   sp=find_b[(PS^PS-1)%67]; PS&=PS-1; r=7-(sp>>3); lp=sp&7;				// rank of pawn
@@ -3943,7 +5093,7 @@ short 	KRvKRP(Game* Gm, Byte *flags)
  
  if(((Gm->Count[0]).officers+(Gm->Count[1]).officers>4)||				// more than two rooks or pawns in game
   ((Gm->Count[1]).pawns>2))				{*flags=128; return 0;}			// back off
- *flags=64;	Val=(Gm->Count[1]).pawns*Paras[9].Val; PS=BP; lk=wk&7;		// default is unclear, material value
+ *flags=64;	Val=(Gm->Count[1]).pawns*Paras[105].Val; PS=BP; lk=wk&7;	// default is unclear, material value
  while(PS)																// parse white pawns
  {
   sp=find_b[(PS^PS-1)%67]; PS&=PS-1; r=sp>>3; lp=sp&7;					// rank of pawn
