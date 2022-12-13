@@ -5,14 +5,16 @@ Astimate 3 UCI Engine by Dr. Axel Steinhage 2022
 Contents:
 ---------
 
-README.txt				This file
-Astimate3_64_bit_avx2.exe   	UCI Engine for 64-Bit Windows and avx2 capable processors ready to use in an UCI-capable GUI (e.g. Arena)
-Astimate3_64_bit_no_avx2.exe	UCI engine for 64-Bit Windows and processors without avx2
-Astimate3.cpp			Source code of Astimate3 in ANSI c
-Astimate.h				Header file with constant definitions required for compiling Astimate3.cpp
-Astimate.pos			Opening book containing around 22k positions generated from gm2600.bin
-Astimate.tre			Opening book containing around 400k positions
-network.nnue			NNUE-network (halfka_v2)
+Astimate3.cpp:			Source code of Astimate3 in ANSI c
+
+Astimate.h:			Header file with constant definitions required for compiling Astimate3.cpp
+
+Astimate.pos:			Opening book containing around 22k positions generated from gm2600.bin
+
+Astimate.tre:			Opening book containing around 400k positions
+
+network.nnue:			NNUE-network (halfka_v2)
+
 
 note: the opening book files and the header file are only required when compiling the source code on your own. At compile time, both books and the header constants are integrated in the executable so that in the engines-directory (e.g. of Arena) only the executable and network.nnue is required. Both books detect move transpositions. If the NNUE option is selected, the network.nnue file should be present in the same directory as the executable.
 
@@ -39,11 +41,16 @@ Features of Astimate3:
 ----------------------
 
 Openings:		Integrated opening books (450k positions) with transposition and setup position detection.
+
 Endgame:		All elementary endgames (also KBNvK), integrated complete library for KPvK and KPvKP with blocked pawns
+
 Search:		Bitboards, NegaScout, Principle Variation Search, Nullmove, Multicut, Internal Iterative Deepening, Late Move Reductions, 
 			Delta Pruning, Quiescence Search, Mate Distance Pruning, Tactics Extensions, Static Exchange Evaluation, Counter and History heuristics, Pondering, ...
+			
 Hash Tables:	Two Tier Transposition Table, Evaluation Table, Pawn Table, Material Table
+
 Multi Threads:	SMP (Shared Memory Parallelization) where the independent threads share history- and transposition table
+
 NNUE:			Astimate can make use of "Efficently Updatable Neural Networks", coded in the file network.nnue. It supports the NNUE versions "halfkp" and "halfka_v2".
 
 Copyright:
