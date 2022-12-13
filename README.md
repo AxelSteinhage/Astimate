@@ -21,7 +21,7 @@ note: the opening book files and the header file are only required when compilin
 Compiling:
 ----------
 
-The executable is ready to use in an UCI-capable chess-GUI in Windows (e.g. Arena http://www.playwitharena.de). However, if you need to compile the engine for your system, you need a the files Astimate3.cpp, Astimate.h, Astimate.pos and Astimate.tre and a c compiler.
+The executable is ready to use in an UCI-capable chess-GUI in Windows (e.g. Arena http://www.playwitharena.de). However, if you need to compile the engine for your system, you need the files Astimate3.cpp, Astimate.h, Astimate.pos and Astimate.tre and a c compiler.
 
 Compiling under Windows (example): Use for instance DevC++ (https://bloodshed-dev-c.de.softonic.com), set Compiler Options (under "Tools") to 64 or 32 bit Release, set the "Optimization Level" to "Highest" and "Language Standard ISO C++11" (under "Tools->Compiler Options->Settings->Code Generation"), select general compiler option "-mavx2" (if machine has avx2) and compile ("Execute->Compile"). If machine has no avx, you need to comment out the line "#define USE_AVX2  1" near the beginning of the code.
 
@@ -36,7 +36,7 @@ Configuring the Engine:
 -----------------------
 
 Somne chess GUIs allow for a configuration of the engine. Astimate3 offers a huge number of configurable parameters. In Arena, for instance, you can go to "Engines->Configuration" to change parameters. However, the default parameters are tuned to give maximum strength.
-Astimate3 is a multi-thread engine. The parameter "HelperThreads" controls, how many processor threads are used by Astimate3 in addition to the main thread. The more helper threads, the faster Astimate3 calculates. However, if more threads are configured than the computer can handle, the engine becomes even slower. The best setting depends, therefore, on your patform. The default is 3 which is a safe setting for most current processors.
+Astimate3 is a multi-thread engine. The parameter "HelperThreads" controls, how many processor threads are used by Astimate3 in addition to the main thread. The more helper threads, the faster Astimate3 calculates. However, if more threads are configured than the computer can handle, the engine becomes even slower. The best setting depends, therefore, on your platform. The default is 3 which is a safe setting for most current processors.
 
 Features of Astimate3:
 ----------------------
