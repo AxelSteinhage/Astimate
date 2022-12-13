@@ -21,7 +21,7 @@ note: the opening book files and the header file are only required when compilin
 Compiling:
 ----------
 
-The executables are ready to use in an UCI-capable chess-GUI in Windows (e.g. Arena http://www.playwitharena.de). However, if you need to compile the engine for your system, you need a the files Astimate3.cpp, Astimate.h, Astimate.pos and Astimate.tre and a c compiler.
+The executable is ready to use in an UCI-capable chess-GUI in Windows (e.g. Arena http://www.playwitharena.de). However, if you need to compile the engine for your system, you need a the files Astimate3.cpp, Astimate.h, Astimate.pos and Astimate.tre and a c compiler.
 
 Compiling under Windows (example): Use for instance DevC++ (https://bloodshed-dev-c.de.softonic.com), set Compiler Options (under "Tools") to 64 or 32 bit Release, set the "Optimization Level" to "Highest" and "Language Standard ISO C++11" (under "Tools->Compiler Options->Settings->Code Generation"), select general compiler option "-mavx2" (if machine has avx2) and compile ("Execute->Compile"). If machine has no avx, you need to comment out the line "#define USE_AVX2  1" near the beginning of the code.
 
@@ -29,7 +29,8 @@ Compiling under Linux (example): use "gcc Astimate3.cpp -Ofast -pthread -mavx2 -
 
 Compiling under Android (example): use the App "C4droid" and therein the compiler "GCC + Bionic" and export the binary (under Export). For Android you can use the app "DroidFish" as GUI.
 
-I have not yet integrated NEON acceleration for ARM chips. Therefore, when NNUE is activated, slow generic neural network inference algorithms will be used.
+If you have an ARM chip with NEON acceleration you can uncomment the line "#define USE_NEON   1" near the beginning of the code before compiling.
+The AVX2 and NEON SIMD acceleration code is used for NNUE only. So if you don't use NNUE, you don't need the SIMD acceleration.
 
 Configuring the Engine:
 -----------------------
@@ -51,7 +52,7 @@ Hash Tables:	Two Tier Transposition Table, Evaluation Table, Pawn Table, Materia
 
 Multi Threads:	SMP (Shared Memory Parallelization) where the independent threads share history- and transposition table
 
-NNUE:			Astimate can make use of "Efficently Updatable Neural Networks", coded in the file network.nnue. It supports the NNUE versions "halfkp" and "halfka_v2".
+NNUE:			Astimate can make use of "Efficently Updatable Neural Networks", coded in the file network.nnue. It supports the NNUE version "halfka_v2".
 
 Copyright:
 ----------
