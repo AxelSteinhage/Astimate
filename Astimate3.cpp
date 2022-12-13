@@ -939,9 +939,9 @@ void	NNUE_UpdateFeatures(Game* Gm, NNUE* Nn)							// update Feature vector afte
 
 short	NNUE_Evaluate(Game* Gm, NNUE* Nn)								// NNUE evaluation function
 {
- int32_t	o,f,sk;
+ int32_t	o,f,sk,n,p;
  int8_t		our,thr,buc;
- int		i,j,k,n;
+ int		i,j,k;
  
  if(Gm->color) {our=1; thr=0;} else {our=0; thr=1;}						// our and their color
 
@@ -953,42 +953,50 @@ short	NNUE_Evaluate(Game* Gm, NNUE* Nn)								// NNUE evaluation function
   
   int32_t 	hid32	[32]	__attribute__((aligned(64))); 				// 32 bit version of hidden layers
   int8_t	hid8 	[32]	__attribute__((aligned(64)));				//  8 bit version of hidden layers
-  __m256i 	ft1,ft2,fv[32],cl=_mm256_setzero_si256(); 					// feature buffers and dense feature vector
- 
+  int32_t   s		[8]		__attribute__((aligned(64)));
+  
+  __m256i 	ft1,ft2,ft3,ft4,ft5,fv[16],cl=_mm256_setzero_si256(); 		// feature buffers and dense feature vector
+  
   // transform sparse features into a dense feature vector. 16 bit neurons are transformed to clamped 8 bit neurons
- 
-  for(i=j=0;i<512;i+=32,j++)											// work with vectors of 32 bytes
-  {
-   ft1   	= _mm256_load_si256((__m256i*)((Nn->F_vec[our])+i));		// load first  16 stm feature neurons (16 bit) from memory
-   ft2    	= _mm256_load_si256((__m256i*)((Nn->F_vec[our])+i+16));		// load second 16 stm feature neurons (16 bit) from memory
-   ft1	  	= _mm256_max_epi8(_mm256_packs_epi16(ft1,ft2),cl);			// pack to 32 neurons (8 bit) and clamp from below
-   fv[j]  	= _mm256_permute4x64_epi64(ft1,216);						// save features
-   ft1    	= _mm256_load_si256((__m256i*)((Nn->F_vec[thr])+i));		// load first  16 op feature neurons from memory
-   ft2    	= _mm256_load_si256((__m256i*)((Nn->F_vec[thr])+i+16));		// load second 16 op feature neurons from memory
-   ft1	  	= _mm256_max_epi8(_mm256_packs_epi16(ft1,ft2),cl);			// pack to 32 neurons (8 bit) and clamp from below
-   fv[j+16]	= _mm256_permute4x64_epi64(ft1,216);						// save features		
-  }
- 
-  // affine transform dense feature vector (1024 x 8 bit) into first hidden layer (16 x 32 bit)
+  // and affine transform first layer
  
   memcpy(hid32,L1biases+16*buc,64); sk=16384*buc;						// load biases (32 bit) of first hidden layer
+  for(j=0;j<16;j++) fv[j]=cl;
  
-  for(j=16;j<32;j++) hid8[j]=0;											// clear unused upper part of first layer neurons
-  
-  for(j=n=0;j<16;j++,n+=1024) 											// handle one neuron of hidden layer 1 at a time
+  for(i=j=0;j<16;i+=32,j++)												// work with vectors of 32 bytes
   {
-   for(ft2=cl,i=k=0;k<32;i+=32,k++)										// work with vectors of 32 bytes
-   { 
-    ft1 = _mm256_maddubs_epi16(fv[k],*(__m256i*)(L1weights+sk+n+i));	// Multiply activation with H1 weigths (32 x 8 bit)
-    ft2 = _mm256_add_epi32(ft2,_mm256_cvtepi16_epi32(*(__m128i*)(&ft1)));// convert to 32 bit and add up
-    ft1 = _mm256_permute4x64_epi64(ft1,0b01001110);						// swap lower and upper half of vector
-    ft2 = _mm256_add_epi32(ft2,_mm256_cvtepi16_epi32(*(__m128i*)(&ft1)));// convert to 32 bit and add up
+   ft1 = _mm256_load_si256((__m256i*)((Nn->F_vec[our])+i));				// load first  16 stm feature neurons (16 bit) from memory	
+   ft2 = _mm256_load_si256((__m256i*)((Nn->F_vec[our])+i+16));			// load second 16 stm feature neurons (16 bit) from memory
+   ft1 = _mm256_max_epi8(_mm256_packs_epi16(ft1,ft2),cl);				// pack to 32 neurons (8 bit) and clamp
+   ft2 = _mm256_load_si256((__m256i*)((Nn->F_vec[thr])+i));				// load first  16 op feature neurons (16 bit) from memory
+   ft3 = _mm256_load_si256((__m256i*)((Nn->F_vec[thr])+i+16));			// load second 16 op feature neurons (16 bit) from memory
+   ft2 = _mm256_max_epi8(_mm256_packs_epi16(ft2,ft3),cl);				// pack to 32 neurons (8 bit) and clamp	
+   if((!_mm256_testz_si256(ft1,ft1))||(!_mm256_testz_si256(ft2,ft2)))	// test if dense feature vectors are zero
+   {
+    ft1 = _mm256_permute4x64_epi64(ft1,216);							// rearrange vectors	
+    ft2 = _mm256_permute4x64_epi64(ft2,216);	
+    for(k=0,n=sk+i,p=n+512;k<16;k++,n+=1024,p+=1024) 					// handle one neuron of hidden layer 1 at a time
+    {
+     ft3 = _mm256_maddubs_epi16(ft1,*(__m256i*)(L1weights+n));			// Multiply activation with H1 weigths (32 x 8 bit)
+     ft4 = _mm256_cvtepi16_epi32(*(__m128i*)(&ft3));					// convert to 32 bit
+     ft3 = _mm256_permute4x64_epi64(ft3,0b01001110);					// swap lower and upper half of vector
+   	 ft3 = _mm256_add_epi32(ft4,_mm256_cvtepi16_epi32(*(__m128i*)(&ft3)));// convert to 32 bit and add up
+	 ft4 = _mm256_maddubs_epi16(ft2,*(__m256i*)(L1weights+p));			// Multiply activation with H1 weigths (32 x 8 bit)
+	 ft5 = _mm256_cvtepi16_epi32(*(__m128i*)(&ft4));					// convert to 32 bit
+     ft4 = _mm256_permute4x64_epi64(ft4,0b01001110);					// swap lower and upper half of vector
+   	 ft5 = _mm256_add_epi32(ft5,_mm256_cvtepi16_epi32(*(__m128i*)(&ft4)));// convert to 32 bit and add up
+   	 fv[k]=_mm256_add_epi32(_mm256_add_epi32(ft3,ft5),fv[k]);			// accumulate
+    }
    }
-   ft2=_mm256_hadd_epi32(_mm256_hadd_epi32(ft2,ft2),ft2);				// sum up elements of vector
-   o=(hid32[j]+_mm256_extract_epi32(ft2,0)+_mm256_extract_epi32(ft2,4))>>6;// sum up elements, bias and divide by 64
-   hid8[j] = (int8_t)(o<0?0:(o>127?127:o));								// clamp neurons and convert to 8 bit
   }
-  
+
+  for(j=0;j<16;j++) 
+  {
+   o=hid32[j]; _mm256_store_si256((__m256i*)(s),fv[j]); 
+   for(k=0;k<8;k++) o+=s[k]; o>>=6;
+   hid8[j]=(int8_t)(o<0?0:(o>127?127:o));
+  }
+   
   cl = _mm256_load_si256((__m256i*)(hid8));								// load activation of first layer neurons
   
   // affine transform first hidden layer (16 x 8 bit) to second hidden layer (32 x 32 bit):
@@ -1023,60 +1031,67 @@ short	NNUE_Evaluate(Game* Gm, NNUE* Nn)								// NNUE evaluation function
   int32_t 	hid32	[32]	__attribute__((aligned(64))); 				// 32 bit version of hidden layers
   int8_t	hid8 	[32]	__attribute__((aligned(64)));				//  8 bit version of hidden layers
 
-  int16x8_t	ft1,ft2;													// feature buffer
-  int8x16_t	fv[64],y,z=vdupq_n_s8(0);									// dense feature vector
+  int16x8_t	ft1,ft2;													// feature buffers 16 Bit
+  int8x16_t	ft3,ft4,ft5,z=vdupq_n_s8(0);								// feature buffers 8 Bit
+  int32x4_t fv[16];														// dense feature vector
  
  // transform sparse features into a dense feature vector. 16 bit neurons are transformed to clamped 8 bit neurons
  
+  memcpy(hid32,L1biases+16*buc,64); sk=16384*buc;						// load biases (32 bit) of first hidden layer
+  for(j=0;j<16;j++) fv[j]=vdupq_n_s32(0);								// load zeros into feature vector
+ 
   for(i=j=0;j<32;i+=16,j++)												// work with vectors of 16 bytes
   {
-   ft1 		= vld1q_s16((Nn->F_vec[our])+i);							// load first 8 stm feature neurons (16 bit) from memory
-   ft2 		= vld1q_s16((Nn->F_vec[our])+i+8);							// load second 8 stm feature neurons (16 bit) from memory
-   fv[j] 	= vmaxq_s8(vcombine_s8(vqmovn_s16(ft1),vqmovn_s16(ft2)),z); // transform to 8 bit, clamp from below and store in feature vector
-   ft1 		= vld1q_s16((Nn->F_vec[thr])+i);							// load first 8 op feature neurons (16 bit) from memory
-   ft2 		= vld1q_s16((Nn->F_vec[thr])+i+8);							// load second 8 op feature neurons (16 bit) from memory
-   fv[j+32] = vmaxq_s8(vcombine_s8(vqmovn_s16(ft1),vqmovn_s16(ft2)),z); // transform to 8 bit, clamp from below and store in feature vector
-  }
- 
- // affine transform dense feature vector (1024 x 8 bit) into first hidden layer (16 x 32 bit)
- 
-  memcpy(hid32,L1biases+16*buc,64); sk=16384*buc;						// load biases (32 bit) of first hidden layer
-
-  for(j=n=0;j<16;j++,n+=1024) 											// handle one neuron of hidden layer 1 at a time
-  {
-   o = hid32[j];														// get bias of neuron
-   for(i=k=0;k<64;i+=16,k++)											// work with vectors of 16 bytes
-   { 
-    z	= vld1q_s8(L1weights+sk+1024*j+i);								// load weights (16x8 bit) 
-    ft1 = vmull_s8(vget_low_s8(fv[k]),vget_low_s8(z));					// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
-    ft1	= vmlal_high_s8(ft1,fv[k],z);									// multiply upper 8 Bytes of features with weights and add to vector
-    o   += vaddvq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)));	// sum up vector elements and add to bias
+   ft1 	= vld1q_s16((Nn->F_vec[our])+i);								// load first 8 stm feature neurons (16 bit) from memory
+   ft2 	= vld1q_s16((Nn->F_vec[our])+i+8);								// load second 8 stm feature neurons (16 bit) from memory	
+   ft3	= vmaxq_s8(vcombine_s8(vqmovn_s16(ft1),vqmovn_s16(ft2)),z); 	// transform to 8 bit, clamp from below and store in feature vector
+   ft1	= vld1q_s16((Nn->F_vec[thr])+i);								// load first 8 opp feature neurons (16 bit) from memory
+   ft2 	= vld1q_s16((Nn->F_vec[thr])+i+8);								// load second 8 opp feature neurons (16 bit) from memory	
+   ft4	= vmaxq_s8(vcombine_s8(vqmovn_s16(ft1),vqmovn_s16(ft2)),z); 	// transform to 8 bit, clamp from below and store in feature vector
+   if(vmaxvq_s8(ft3)) for(k=0,n=sk+i;k<16;k++,n+=1024) 					// active features: handle one neuron of hidden layer 1 at a time
+   {
+   	ft5	= vld1q_s8(L1weights+n);										// load weights (16x8 bit)
+   	ft1 = vmull_s8(vget_low_s8(ft3),vget_low_s8(ft5));					// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+   	ft1	= vmlal_high_s8(ft1,ft3,ft5);									// multiply upper 8 Bytes of features with weights and add to vector
+	fv[k]=vaddq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)),fv[k]);// add activation of the 16 stm neurons to feature vector
    }
-   o>>=6; hid8[j] = (int8_t)(o<0?0:(o>127?127:o));						// divide by 64, clamp neuron and convert to 8 bit
+   if(vmaxvq_s8(ft4)) for(k=0,n=sk+i+512;k<16;k++,n+=1024)				// active features: handle one neuron of hidden layer 1 at a time
+   {
+	ft5	= vld1q_s8(L1weights+n);										// load weights (16x8 bit)
+	ft1 = vmull_s8(vget_low_s8(ft4),vget_low_s8(ft5));					// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+   	ft1	= vmlal_high_s8(ft1,ft4,ft5);									// multiply upper 8 Bytes of features with weights and add to vector
+	fv[k]=vaddq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)),fv[k]);// add activation of the 16 opp neurons to feature vector
+   }
   }
-   
+
+  for(j=0;j<16;j++) 													// calculate first hidden layer neurons
+  {
+   o=(hid32[j]+vaddvq_s32(fv[j]))>>6;									// add up vector elements horizontally
+   hid8[j]=(int8_t)(o<0?0:(o>127?127:o));								// clamp and transform to 8 Bit
+  }
+
  // affine transform first hidden layer (16 x 8 bit) to second hidden layer (32 x 32 bit):
  
-  memcpy(hid32,L2biases+32*buc,128); sk=1024*buc; y = vld1q_s8(hid8);	// load biases (32 bit) and neurons of second hidden layer
+  memcpy(hid32,L2biases+32*buc,128); sk=1024*buc; ft4 = vld1q_s8(hid8);	// load biases (32 bit) and neurons of second hidden layer
  
   for(j=0;j<32;j++) 													// handle one neuron at a time
   {
-   z	= vld1q_s8(L2weights+sk+32*j);									// load first part of weights (16x8 bit) and neurons
-   ft1	= vmull_s8(vget_low_s8(y),vget_low_s8(z));						// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
-   ft1	= vmlal_high_s8(ft1,y,z);										// multiply upper 8 Bytes of features with weights and add to vector
+   ft5	= vld1q_s8(L2weights+sk+32*j);									// load first part of weights (16x8 bit) and neurons
+   ft1	= vmull_s8(vget_low_s8(ft4),vget_low_s8(ft5));					// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+   ft1	= vmlal_high_s8(ft1,ft4,ft5);									// multiply upper 8 Bytes of features with weights and add to vector
    o    = vaddvq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)));	// sum up vector elements 									
    o	= (hid32[j]+o)>>6; hid8[j] = (int8_t)(o<0?0:(o>127?127:o));		// add bias, divide by 64, clamp neuron and convert to 8 bit
   }
  
  // affine transform second hidden layer activation from 32 x 8 bit to output 1 x 32 bit:
- 
-  z		= vld1q_s8(L3weights+32*buc); y=vld1q_s8(hid8);					// load first part of weights (16x8 bit) and neurons
-  ft1	= vmull_s8(vget_low_s8(y),vget_low_s8(z));						// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
-  ft1	= vmlal_high_s8(ft1,y,z);										// multiply upper 8 Bytes of features with weights and add to vector
+  
+  ft5	= vld1q_s8(L3weights+32*buc); ft4=vld1q_s8(hid8);				// load first part of weights (16x8 bit) and neurons
+  ft1	= vmull_s8(vget_low_s8(ft4),vget_low_s8(ft5));					// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+  ft1	= vmlal_high_s8(ft1,ft4,ft5);									// multiply upper 8 Bytes of features with weights and add to vector
   o     = vaddvq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)));	// sum up vector elements 
-  z		= vld1q_s8(L3weights+32*buc+16); y=vld1q_s8(hid8+16);			// load first part of weights (16x8 bit) and neurons
-  ft1	= vmull_s8(vget_low_s8(y),vget_low_s8(z));						// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
-  ft1	= vmlal_high_s8(ft1,y,z);										// multiply upper 8 Bytes of features with weights and add to vector
+  ft5	= vld1q_s8(L3weights+32*buc+16); ft4=vld1q_s8(hid8+16);			// load first part of weights (16x8 bit) and neurons
+  ft1	= vmull_s8(vget_low_s8(ft4),vget_low_s8(ft5));					// multiply lower 8 Bytes of features with weights and store as 8x16 bit vector
+  ft1	= vmlal_high_s8(ft1,ft4,ft5);									// multiply upper 8 Bytes of features with weights and add to vector
   o    += vaddvq_s32(vaddl_s16(vget_low_s16(ft1),vget_high_s16(ft1)));	// sum up vector elements 									
   o	   += L3biases[buc]; 												// add bias, divide by 64, clamp neuron and convert to 8 bit
  
@@ -1109,9 +1124,7 @@ short	NNUE_Evaluate(Game* Gm, NNUE* Nn)								// NNUE evaluation function
 
  o+=(Nn->F_psq[our][buc]-Nn->F_psq[thr][buc])/2;						// new HalfKA version: add psqt value
  
- //return short(o/16);
- return (short)(o/Paras[106].Val);										// scale output
- //return (short)(o/Paras[106].Val+rand());										// scale output				
+ return (short)(o/Paras[106].Val);										// scale output			
 }
 
 void	NNUE_SpeedTest(Game* Gm, NNUE* Nn)
@@ -1133,8 +1146,6 @@ void	NNUE_SpeedTest(Game* Gm, NNUE* Nn)
  }
  printf("Duration: %lf +- %lf ms \n",tacc/10,(tmax-tmin)/2);
 }
-
-
 
 void	PrintVector(void* v, Byte l)
 {
@@ -2879,7 +2890,7 @@ short	Evaluation(Game* Gm, NNUE* Nn,  Mvs* Mv, short Alpha, short Beta)// evalua
 {
  BitMap ELOCK,EHASH,PLOCK[5],PP[2],AP[2],PAI,PAB,PAD,PAP,PAC,PAW,PCH,PPH,CM;
  BitMap	KM,PS,NM,MM,MP[5],PM,PN,PO;
- short	Val,Oval,Eval,Dval,cl,p;
+ short	Val,Oval,Eval,Dval,cl,p,Val2;
  Byte	pk[2],gp,flg,co,sp;
  Byte	*ekey,*pkey;
  
@@ -3791,7 +3802,7 @@ AEL:																	// jump here for AEL pruning
 	goto Hash;															// fail high cutoff
    }
    
-   //if((Val>Alpha)&&(Gm->Threadn)) StoreHash(Gm,Val,*Bestm,depth,2);
+   if((Val>Alpha)&&(Gm->Threadn)) StoreHash(Gm,Val,*Bestm,depth,2);
   }
   	
   if(Val>Alpha) Alpha=Val;												// adapt alpha
@@ -3835,6 +3846,7 @@ void	*SmpSearchHelper(void* Ms)
  Game*	Gm=(Game*)(Ms);
  NNUE	Nn;
  Byte	d;
+ void *a;
  
  Gm->Finished=false; 
  if(Options[8].Val) NNUE_InitFeatures(Gm,&Nn,3); 		                // init NNUE features
@@ -3843,13 +3855,13 @@ void	*SmpSearchHelper(void* Ms)
   Gm->noloose=0; Gm->NODES=0; d=((Gm->Threadn-1)%3)+1;					// d=1,2,3,1,2,3,1,2,3...
   if((Gm->idepth<=midepth)&&(254-d>midepth)) Gm->idepth=d+midepth;		// set thread parameters
   else if(254-d>Gm->idepth) Gm->idepth+=d;			
-  Search(Gm,&Nn,Malpha,Mbeta,Gm->idepth,&(Gm->Bestmove));				// search with open window
+  Search(Gm,&Nn,Malpha,Mbeta,Gm->idepth,&(Gm->Bestmove));				// search with global alpha/beta window
   //Search(Gm,&Nn,Malpha-1,Mbeta+1,Gm->idepth,&(Gm->Bestmove));				// search with open window
   //Search(Gm,&Nn,-MaxScore,MaxScore,Gm->idepth,&(Gm->Bestmove));				// search with open window
  
  }
  Gm->Finished=true;
- 
+ pthread_exit(a);
  return 0;
 }
 
@@ -3910,7 +3922,7 @@ void	IterateSearch(Game* Gm)											// search for best move
  
  for(i=0;i<Paras[93].Val;i++) 											// initialize threads
  {
-  Gp[i]=*Gm; Gp[i].Threadn=i+1; Gp[i].idepth=8;
+  Gp[i]=*Gm; Gp[i].Threadn=i+1; Gp[i].idepth=6;
   pthread_create(&(Gp[i].Tid), NULL, SmpSearchHelper, (void*)(Gp+i));	// create new helper thread
  }
  
